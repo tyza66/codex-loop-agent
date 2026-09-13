@@ -1,0 +1,20 @@
+{
+  "name": "codex-loop-agent",
+  "interface": {
+    "displayName": "Codex Loop Agent"
+  },
+  "plugins": [
+    {
+      "name": "codex-loop-agent",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-loop-agent"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
