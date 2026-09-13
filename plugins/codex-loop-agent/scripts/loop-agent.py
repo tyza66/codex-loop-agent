@@ -903,7 +903,7 @@ def cmd_logs(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="codex-loop-agent", description=__doc__)
-    parser.add_argument("--version", action="version", version="codex-loop-agent 1.0.0")
+    parser.add_argument("--version", action="version", version="codex-loop-agent 1.0.20260914")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     start = subparsers.add_parser("start", help="start an endless loop for a Codex session")

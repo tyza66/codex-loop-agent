@@ -1,6 +1,6 @@
 {
   "name": "codex-loop-agent",
-  "version": "1.0.0+codex.20260913045636",
+  "version": "1.0.20260914",
   "description": "Endless same-session loop for Codex: activate a thread with /forever and it keeps working after every answer using a configurable continuation prompt, with retry, user-message priority, and a stop command.",
   "author": {
     "name": "tyza66",
