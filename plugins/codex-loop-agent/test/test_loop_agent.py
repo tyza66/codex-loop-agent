@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = (
     Path(__file__).resolve().parents[1] / "scripts" / "loop-agent.py"
@@ -118,6 +119,45 @@ class LoopAgentTests(unittest.TestCase):
         self.assertEqual(loop_agent.event_user_messages(events)[0]["text"], "original task")
         self.assertGreater(loop_agent.last_completion_ts(events), 0)
 
+    def test_current_object_payload_event_schema(self):
+        path = self.sessions_root / "2026" / "09" / "13" / "rollout-object.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        events = [
+            {
+                "timestamp": "2026-09-13T00:00:01.000Z",
+                "type": "turn_context",
+                "payload": {"cwd": "/tmp/current-schema"},
+            },
+            {
+                "timestamp": "2026-09-13T00:00:02.000Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "object user"},
+            },
+            {
+                "timestamp": "2026-09-13T00:00:03.000Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete"},
+            },
+            {
+                "timestamp": "2026-09-13T00:00:04.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "object answer"}],
+                },
+            },
+        ]
+        with path.open("w", encoding="utf-8") as handle:
+            for event in events:
+                handle.write(json.dumps(event) + "\n")
+        self.assertEqual(loop_agent.session_cwd(path), "/tmp/current-schema")
+        loaded = loop_agent.read_events(path)
+        users = loop_agent.event_user_messages(loaded)
+        self.assertEqual([m["text"] for m in users], ["object user"])
+        self.assertGreater(loop_agent.last_completion_ts(loaded), 0)
+        self.assertEqual(loop_agent.last_assistant_text(loaded), "object answer")
+
     def test_resolve_session_by_cwd_prefers_newest_match(self):
         old_path = session_file(self.sessions_root, SID, "/tmp/project", mtime=1000)
         new_path = session_file(self.sessions_root, OTHER_SID, "/tmp/project", mtime=2000)
@@ -195,6 +235,41 @@ class LoopAgentTests(unittest.TestCase):
         events = loop_agent.read_events(session)
         texts = [m["text"] for m in loop_agent.event_user_messages(events)]
         self.assertEqual(texts, ["original task", "继续"])
+
+    def test_run_loop_does_not_buffer_codex_stdout(self):
+        fake_codex = self.bin_dir / "codex"
+        fake_codex.write_text("#!/usr/bin/env python3\nsys.exit(0)\n")
+        fake_codex.chmod(0o755)
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "cwd": str(self.home.resolve()),
+                "continuation": "继续",
+                "max_rounds": 1,
+                "poll_ms": 1,
+                "quiet": True,
+            }
+        )
+        captured = {}
+
+        class FakeProcess:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return "", ""
+
+        def capture(*args, **kwargs):
+            captured.update(kwargs)
+            return FakeProcess()
+
+        with mock.patch.object(
+            loop_agent.subprocess, "Popen", side_effect=capture
+        ):
+            rc = loop_agent.run_loop(SID, session, state)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["stdout"], loop_agent.subprocess.DEVNULL)
 
     def test_build_codex_command_uses_resume_compatible_flags(self):
         command = loop_agent.build_codex_command(SID, "继续任务")

@@ -551,7 +551,7 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
             global _CURRENT_PROCESS
             process = subprocess.Popen(
                 command,
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 cwd=cwd,
                 stderr=subprocess.PIPE,
                 text=True,
