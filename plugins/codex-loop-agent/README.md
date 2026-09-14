@@ -11,6 +11,7 @@ Codex 无尽模式插件：把 dsh-loop-agent 的“按需无尽循环”带到 
 3. 上一轮完成后，用 `codex exec resume <session> <continuation>` 把延续语注入同一个会话。
 4. 失败时按指数退避原样重试；上下文/token 压力类错误会输出压缩建议后继续重试。
 5. 直到用户 `/stop`、发送停止短语、运行 `stop` 命令、`--max-rounds` 或 `--until` 到期，或全局开关关闭。
+6. 对应会话被停止、归档或删除时，该会话的循环也会自动停止。
 
 ## 目录
 

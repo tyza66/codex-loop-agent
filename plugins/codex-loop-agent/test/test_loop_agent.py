@@ -158,6 +158,24 @@ class LoopAgentTests(unittest.TestCase):
         self.assertGreater(loop_agent.last_completion_ts(loaded), 0)
         self.assertEqual(loop_agent.last_assistant_text(loaded), "object answer")
 
+    def test_terminal_event_timestamps_separate_abort_from_complete(self):
+        events = [
+            {
+                "timestamp": "2026-09-13T00:00:01.000Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete"},
+            },
+            {
+                "timestamp": "2026-09-13T00:00:02.000Z",
+                "type": "event_msg",
+                "payload": {"type": "turn_aborted", "reason": "interrupted"},
+            },
+        ]
+        completion = loop_agent.last_completion_ts(events)
+        aborted = loop_agent.last_aborted_ts(events)
+        self.assertGreater(completion, 0)
+        self.assertGreater(aborted, completion)
+
     def test_resolve_session_by_cwd_prefers_newest_match(self):
         old_path = session_file(self.sessions_root, SID, "/tmp/project", mtime=1000)
         new_path = session_file(self.sessions_root, OTHER_SID, "/tmp/project", mtime=2000)
@@ -270,6 +288,60 @@ class LoopAgentTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(captured["stdout"], loop_agent.subprocess.DEVNULL)
+
+    def test_run_loop_stops_when_session_file_is_missing(self):
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "cwd": str(self.home.resolve()),
+                "continuation": "继续",
+                "poll_ms": 1,
+                "quiet": True,
+            }
+        )
+        session.unlink()
+        with mock.patch.object(
+            loop_agent.subprocess, "Popen", side_effect=AssertionError("should not resume")
+        ):
+            rc = loop_agent.run_loop(SID, session, state)
+        self.assertEqual(rc, 0)
+        final = loop_agent.load_state(SID)
+        self.assertEqual(final["status"], "stopped")
+        self.assertTrue(final["stop_requested"])
+
+    def test_run_loop_stops_when_latest_terminal_event_is_aborted(self):
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        with session.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "timestamp": "2026-09-13T00:00:05.000Z",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "turn_aborted",
+                            "reason": "interrupted",
+                        },
+                    }
+                ) + "\n"
+            )
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "cwd": str(self.home.resolve()),
+                "continuation": "继续",
+                "poll_ms": 1,
+                "quiet": True,
+            }
+        )
+        with mock.patch.object(
+            loop_agent.subprocess, "Popen", side_effect=AssertionError("should not resume")
+        ):
+            rc = loop_agent.run_loop(SID, session, state)
+        self.assertEqual(rc, 0)
+        final = loop_agent.load_state(SID)
+        self.assertEqual(final["status"], "stopped")
+        self.assertTrue(final["stop_requested"])
 
     def test_build_codex_command_uses_resume_compatible_flags(self):
         command = loop_agent.build_codex_command(SID, "继续任务")

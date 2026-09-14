@@ -354,7 +354,22 @@ def last_completion_ts(events: list[dict[str, Any]]) -> float:
         payload = event_payload(event)
         if not payload:
             continue
-        if payload.get("type") not in ("task_complete", "turn_aborted"):
+        if payload.get("type") != "task_complete":
+            continue
+        timestamp = iso_to_epoch(event.get("timestamp")) or iso_to_epoch(
+            payload.get("timestamp")
+        )
+        latest = max(latest, timestamp)
+    return latest
+
+
+def last_aborted_ts(events: list[dict[str, Any]]) -> float:
+    latest = 0.0
+    for event in events:
+        payload = event_payload(event)
+        if not payload:
+            continue
+        if payload.get("type") != "turn_aborted":
             continue
         timestamp = iso_to_epoch(event.get("timestamp")) or iso_to_epoch(
             payload.get("timestamp")
@@ -518,7 +533,11 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
             return stop_loop("--until deadline reached")
 
         events = read_events(session_file)
+        if not session_file.exists():
+            return stop_loop("session file was archived or deleted")
         last_completion = max(last_completion, last_completion_ts(events))
+        if last_aborted_ts(events) > last_completion:
+            return stop_loop("thread turn was stopped")
         messages = event_user_messages(events)
 
         humans = [m for m in messages if m["sha"] not in sent_hashes]

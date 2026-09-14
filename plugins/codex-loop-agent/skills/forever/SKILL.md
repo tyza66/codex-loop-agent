@@ -65,7 +65,10 @@ not as a brand-new request from the user:
 
 ## Stopping
 
-The user can stop in two ways. Run this immediately whenever the user asks:
+A loop also stops automatically when its thread is stopped from the Codex UI,
+archived, or deleted.
+
+Run the driver stop command immediately whenever the user asks:
 
 ```sh
 SCRIPT=$(find ~/.codex/plugins -path '*/codex-loop-agent/scripts/loop-agent.py' -print -quit)
