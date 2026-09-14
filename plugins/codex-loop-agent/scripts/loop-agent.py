@@ -26,6 +26,8 @@ import signal
 import subprocess
 import sys
 import time
+import sqlite3
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -148,6 +150,7 @@ def load_state(session_id: str) -> dict[str, Any]:
         "rounds": 0,
         "started_at": None,
         "pid_started": None,
+        "armed_at": 0.0,
         "updated_at": None,
         "stop_requested": False,
         "continuation": None,
@@ -603,6 +606,62 @@ def inject_via_queue(session_id: str, prompt: str) -> str:
     return output
 
 
+def parse_queued_item_id(output: str) -> str | None:
+    match = re.search(r"Queued message ([0-9a-fA-F-]+) for thread", output or "")
+    return match.group(1) if match else None
+
+
+def queue_database_path() -> Path | None:
+    matches = sorted(
+        codex_home().glob("queue_*.sqlite"),
+        key=lambda path: path.stat().st_mtime_ns,
+    )
+    return matches[-1] if matches else None
+
+
+def queued_user_message_count(
+    session_id: str, exclude_ids: set[str] | None = None
+) -> int | None:
+    """Count queue items still waiting for this thread's current turn.
+
+    Returns None when the queue store cannot be read. The caller treats
+    that as unknown and falls back to session-history observation.
+    """
+    path = queue_database_path()
+    if path is None:
+        return 0
+    skip = set(exclude_ids or [])
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            rows = connection.execute(
+                "SELECT id FROM queued_items WHERE thread_id = ?", (session_id,)
+            ).fetchall()
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError):
+        return None
+    return sum(1 for (item_id,) in rows if item_id not in skip)
+
+
+def queue_wait_outcome(
+    events: list[dict[str, Any]],
+    prompt: str,
+    sent_hashes: set[str],
+    baseline_ts: float,
+) -> str:
+    messages = event_user_messages(events)
+    seen = {message["sha"] for message in messages}
+    if sha256_text(prompt) in seen:
+        return "observed"
+    for message in messages:
+        if message["sha"] in sent_hashes:
+            continue
+        if message["ts"] > baseline_ts:
+            return "user_pending"
+    return "waiting"
+
+
 def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
     global _CURRENT_SESSION
     _CURRENT_SESSION = session_id
@@ -619,6 +678,8 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
     poll_seconds = float(state.get("poll_ms") or 2000) / 1000.0
     timeout = float(state.get("timeout_seconds") or 0)
     quiet = bool(state.get("quiet", False))
+    # 0 means "no arm-time filter"; cmd_start stamps the real activation time.
+    armed_at = float(state.get("armed_at") or 0.0)
 
     state["status"] = "running"
     state["pid"] = os.getpid()
@@ -626,6 +687,7 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
     save_state(session_id, state)
 
     sent_hashes = set(state.get("sent_hashes") or [])
+    queued_item_ids: set[str] = set(state.get("queued_item_ids") or [])
     rounds = int(state.get("rounds") or 0)
     last_completion = float(state.get("last_completion_ts") or 0.0)
     backoff = initial_backoff
@@ -636,6 +698,7 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
     def persist_progress(status: str = "running") -> None:
         state["status"] = status
         state["sent_hashes"] = sorted(sent_hashes)
+        state["queued_item_ids"] = sorted(queued_item_ids)
         state["rounds"] = rounds
         state["last_completion_ts"] = last_completion
         save_state(session_id, state)
@@ -681,8 +744,9 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
         last_completion = max(last_completion, last_completion_ts(events))
         messages = event_user_messages(events)
 
-        humans = [m for m in messages if m["sha"] not in sent_hashes]
-        loops = [m for m in messages if m["sha"] in sent_hashes]
+        relevant = [m for m in messages if m["ts"] >= armed_at]
+        humans = [m for m in relevant if m["sha"] not in sent_hashes]
+        loops = [m for m in relevant if m["sha"] in sent_hashes]
         latest_loop_ts = loops[-1]["ts"] if loops else 0.0
         for human in humans:
             if human["ts"] > latest_loop_ts and is_stop_message(human["text"]):
@@ -709,11 +773,15 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
 
         transport = str(state.get("transport") or "queue")
         if transport == "queue":
+            queued_at = time.time()
             log_line(session_id, f"round {rounds + 1}: queueing continuation", quiet)
             state["last_attempt_at"] = now_iso()
             persist_progress()
             try:
-                inject_via_queue(session_id, prompt)
+                queue_output = inject_via_queue(session_id, prompt)
+                queued_item_id = parse_queued_item_id(queue_output)
+                if queued_item_id:
+                    queued_item_ids.add(queued_item_id)
             except (KeyboardInterrupt, SystemExit):
                 raise
             except BaseException as exc:
@@ -735,11 +803,47 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
             while time.time() < deadline:
                 if not session_file.exists():
                     return stop_loop("session file was archived or deleted")
-                seen = {
-                    m["sha"] for m in event_user_messages(read_events(session_file))
-                }
-                if sha256_text(prompt) in seen:
+                waiting = queued_user_message_count(session_id, queued_item_ids)
+                if queued_item_ids and waiting is not None and waiting == 0:
+                    outcome = queue_wait_outcome(
+                        read_events(session_file), prompt, sent_hashes, queued_at
+                    )
+                    if outcome == "observed":
+                        observed = True
+                        break
+                if waiting:
+                    current_state = load_state(session_id)
+                if waiting:
+                    if current_state.get("stop_requested"):
+                        return stop_loop("stop requested via state file")
+                    if load_global_config().get("disabled"):
+                        persist_progress("disabled")
+                        log_line(
+                            session_id,
+                            "global endless-loop switch is off; use `config enable` to turn it back on",
+                            quiet,
+                        )
+                        return 0
+                    log_line(
+                        session_id,
+                        f"{waiting} user message(s) still queued ahead of the continuation",
+                        quiet,
+                    )
+                    time.sleep(max(0.2, poll_seconds / 2.0))
+                    continue
+                outcome = queue_wait_outcome(
+                    read_events(session_file), prompt, sent_hashes, queued_at
+                )
+                if outcome == "observed":
                     observed = True
+                    break
+                if outcome == "user_pending":
+                    log_line(
+                        session_id,
+                        "a real user message arrived while the continuation was queued; yielding to it",
+                        quiet,
+                    )
+                    persist_progress()
                     break
                 current_state = load_state(session_id)
                 if current_state.get("stop_requested"):
@@ -954,6 +1058,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             "cwd": str(cwd),
             "status": "starting",
             "started_at": now_iso(),
+            "armed_at": time.time(),
             "stop_requested": False,
             "continuation": args.continuation
             or load_global_config().get("continuation", DEFAULT_CONTINUATION),
