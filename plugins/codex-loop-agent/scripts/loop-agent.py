@@ -158,6 +158,7 @@ def load_state(session_id: str) -> dict[str, Any]:
         "backoff_factor": 2.0,
         "poll_ms": 2000,
         "timeout_seconds": 0,
+        "transport": "queue",
         "quiet": False,
         "sent_hashes": [],
         "last_completion_ts": 0.0,
@@ -551,6 +552,33 @@ def build_codex_command(
     return command
 
 
+def build_queue_command(session_id: str, prompt: str) -> list[str]:
+    codex = shutil.which("codex")
+    if not codex:
+        raise RuntimeError("codex executable not found on PATH")
+    return [codex, "queue", "--thread", session_id, "--message", prompt]
+
+
+def inject_via_queue(session_id: str, prompt: str) -> str:
+    """Enqueue the continuation into the running desktop session.
+
+    Returns the combined CLI output. Raises RuntimeError when the queue
+    command reports a failure so the caller can retry with backoff.
+    """
+    command = build_queue_command(session_id, prompt)
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=30,
+    )
+    output = (result.stdout or "").strip()
+    if result.returncode != 0:
+        raise RuntimeError(output or f"codex queue exited {result.returncode}")
+    return output
+
+
 def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
     global _CURRENT_SESSION
     _CURRENT_SESSION = session_id
@@ -654,6 +682,72 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
             if failed_prompt is not None
             else render_continuation(continuation, last_answer, rounds + 1, task)
         )
+
+        transport = str(state.get("transport") or "queue")
+        if transport == "queue":
+            log_line(session_id, f"round {rounds + 1}: queueing continuation", quiet)
+            state["last_attempt_at"] = now_iso()
+            persist_progress()
+            try:
+                inject_via_queue(session_id, prompt)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:
+                detail = str(exc).strip() or exc.__class__.__name__
+                log_line(
+                    session_id,
+                    f"queue injection failed ({exc.__class__.__name__}): {detail}",
+                    quiet,
+                )
+                note_error("queue_error", detail)
+                time.sleep(backoff)
+                backoff = min(max_backoff, backoff * backoff_factor)
+                continue
+            # The message is queued, not yet consumed. Wait until we observe it
+            # land in the session history before queueing the next one so the
+            # queue never piles up duplicate continuations.
+            deadline = time.time() + max(30.0, poll_seconds * 15)
+            observed = False
+            while time.time() < deadline:
+                if not session_file.exists():
+                    return stop_loop("session file was archived or deleted")
+                seen = {
+                    m["sha"] for m in event_user_messages(read_events(session_file))
+                }
+                if sha256_text(prompt) in seen:
+                    observed = True
+                    break
+                current_state = load_state(session_id)
+                if current_state.get("stop_requested"):
+                    return stop_loop("stop requested via state file")
+                if load_global_config().get("disabled"):
+                    persist_progress("disabled")
+                    log_line(
+                        session_id,
+                        "global endless-loop switch is off; use `config enable` to turn it back on",
+                        quiet,
+                    )
+                    return 0
+                time.sleep(max(0.2, poll_seconds / 2.0))
+            if observed:
+                rounds += 1
+                sent_hashes.add(sha256_text(prompt))
+                last_completion = max(last_completion, time.time())
+                backoff = initial_backoff
+                failed_prompt = None
+                state.pop("last_error_kind", None)
+                state.pop("last_error", None)
+                persist_progress()
+                log_line(session_id, f"round {rounds} finished", quiet)
+            else:
+                log_line(
+                    session_id,
+                    "queue accepted the continuation but it has not been consumed yet; waiting",
+                    quiet,
+                )
+                persist_progress()
+            time.sleep(poll_seconds)
+            continue
 
         log_line(session_id, f"round {rounds + 1}: resuming session", quiet)
         state["last_attempt_at"] = now_iso()
@@ -846,6 +940,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             "backoff_factor": float(args.backoff_factor),
             "poll_ms": float(args.poll_ms),
             "timeout_seconds": float(args.timeout_seconds or 0),
+            "transport": args.transport,
             "quiet": bool(args.quiet),
         }
     )
@@ -879,6 +974,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         str(state["poll_ms"]),
         "--timeout-seconds",
         str(state["timeout_seconds"]),
+        "--transport",
+        str(state.get("transport") or "queue"),
     ]
     if state.get("until"):
         command += ["--until", state["until"]]
@@ -1100,6 +1197,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--backoff-factor", type=float, default=2.0)
     start.add_argument("--poll-ms", type=float, default=2000, help="user-priority poll interval")
     start.add_argument("--timeout-seconds", type=float, default=0, help="max seconds per resume")
+    start.add_argument("--transport", choices=("queue", "exec"), default="queue", help="how continuations are delivered")
     start.add_argument("--quiet", action="store_true")
     start.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
     start.add_argument("--dir-from-session", action="store_true", help=argparse.SUPPRESS)

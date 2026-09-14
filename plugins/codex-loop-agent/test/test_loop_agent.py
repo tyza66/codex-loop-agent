@@ -260,6 +260,7 @@ class LoopAgentTests(unittest.TestCase):
         state = loop_agent.load_state(SID)
         state.update(
             {
+                "transport": "exec",
                 "cwd": str(self.home.resolve()),
                 "continuation": "继续",
                 "poll_ms": 1,
@@ -356,6 +357,7 @@ class LoopAgentTests(unittest.TestCase):
         state = loop_agent.load_state(SID)
         state.update(
             {
+                "transport": "exec",
                 "cwd": str(self.home.resolve()),
                 "continuation": "继续",
                 "max_rounds": 1,
@@ -380,6 +382,7 @@ class LoopAgentTests(unittest.TestCase):
         state = loop_agent.load_state(SID)
         state.update(
             {
+                "transport": "exec",
                 "cwd": str(self.home.resolve()),
                 "continuation": "继续",
                 "max_rounds": 1,
@@ -415,6 +418,7 @@ class LoopAgentTests(unittest.TestCase):
         state = loop_agent.load_state(SID)
         state.update(
             {
+                "transport": "exec",
                 "cwd": str(self.home.resolve()),
                 "continuation": "继续",
                 "poll_ms": 1,
@@ -449,6 +453,7 @@ class LoopAgentTests(unittest.TestCase):
         state = loop_agent.load_state(SID)
         state.update(
             {
+                "transport": "exec",
                 "cwd": str(self.home.resolve()),
                 "continuation": "继续",
                 "poll_ms": 1,
@@ -510,6 +515,7 @@ class LoopAgentTests(unittest.TestCase):
         state = loop_agent.load_state(SID)
         state.update(
             {
+                "transport": "exec",
                 "cwd": str(self.home.resolve()),
                 "continuation": "继续",
                 "poll_ms": 1,
@@ -763,6 +769,7 @@ class LoopAgentTests(unittest.TestCase):
         state = loop_agent.load_state(SID)
         state.update(
             {
+                "transport": "exec",
                 "cwd": str(self.home.resolve()),
                 "continuation": "继续",
                 "poll_ms": 1,
@@ -797,6 +804,7 @@ class LoopAgentTests(unittest.TestCase):
         state = loop_agent.load_state(SID)
         state.update(
             {
+                "transport": "exec",
                 "cwd": str(self.home.resolve()),
                 "continuation": "继续",
                 "poll_ms": 1,
@@ -828,6 +836,7 @@ class LoopAgentTests(unittest.TestCase):
         state = loop_agent.load_state(SID)
         state.update(
             {
+                "transport": "exec",
                 "cwd": str(self.home.resolve()),
                 "continuation": "继续",
                 "poll_ms": 1,
@@ -859,6 +868,81 @@ class LoopAgentTests(unittest.TestCase):
         self.assertIsNotNone(observed[0])
         self.assertEqual(loop_agent.load_state(SID)["last_error_kind"], "exit_nonzero")
 
+
+    def test_run_loop_queue_transport_injects_and_waits_for_consumption(self):
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "transport": "queue",
+                "cwd": str(self.home.resolve()),
+                "continuation": "继续",
+                "poll_ms": 1,
+                "quiet": True,
+            }
+        )
+        loop_agent.save_state(SID, state)
+        injected = []
+
+        def fake_queue(session_id, prompt):
+            injected.append(prompt)
+            with session.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "timestamp": "2026-09-13T00:00:20.000Z",
+                            "payload": {
+                                "type": "user_message",
+                                "message": prompt,
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            state["stop_requested"] = True
+            loop_agent.save_state(SID, state)
+            return f"Queued {prompt}"
+
+        with mock.patch.object(
+            loop_agent, "inject_via_queue", side_effect=fake_queue
+        ):
+            rc = loop_agent.run_loop(SID, session, state)
+        self.assertEqual(rc, 0)
+        self.assertEqual(injected, ["继续"])
+        final = loop_agent.load_state(SID)
+        self.assertEqual(final["rounds"], 1)
+        self.assertEqual(final["status"], "stopped")
+
+    def test_run_loop_queue_transport_retries_on_queue_error(self):
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "transport": "queue",
+                "cwd": str(self.home.resolve()),
+                "continuation": "继续",
+                "poll_ms": 1,
+                "quiet": True,
+            }
+        )
+        loop_agent.save_state(SID, state)
+        calls = []
+
+        def flaky(session_id, prompt):
+            calls.append(prompt)
+            state["stop_requested"] = True
+            loop_agent.save_state(SID, state)
+            raise RuntimeError("queue unavailable")
+
+        with mock.patch.object(
+            loop_agent, "inject_via_queue", side_effect=flaky
+        ):
+            rc = loop_agent.run_loop(SID, session, state)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        final = loop_agent.load_state(SID)
+        self.assertEqual(final["last_error_kind"], "queue_error")
 
     def test_build_codex_command_uses_resume_compatible_flags(self):
         command = loop_agent.build_codex_command(SID, "继续任务")
