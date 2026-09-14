@@ -156,7 +156,6 @@ def load_state(session_id: str) -> dict[str, Any]:
         "max_backoff_ms": 32000,
         "backoff_factor": 2.0,
         "poll_ms": 2000,
-        "approve_for_me": True,
         "timeout_seconds": 0,
         "quiet": False,
         "sent_hashes": [],
@@ -436,8 +435,6 @@ def pending_human_message(
 def build_codex_command(
     session_id: str,
     prompt: str,
-    cwd: Path,
-    approve_for_me: bool,
 ) -> list[str]:
     codex = shutil.which("codex")
     if not codex:
@@ -448,15 +445,9 @@ def build_codex_command(
         "resume",
         session_id,
         prompt,
-        "--cd",
-        str(cwd),
         "--skip-git-repo-check",
         "--json",
-        "--color",
-        "never",
     ]
-    if approve_for_me:
-        command.append("--approve-for-me")
     return command
 
 
@@ -474,7 +465,6 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
     max_backoff = float(state.get("max_backoff_ms") or 32000) / 1000.0
     backoff_factor = float(state.get("backoff_factor") or 2.0)
     poll_seconds = float(state.get("poll_ms") or 2000) / 1000.0
-    approve_for_me = bool(state.get("approve_for_me", True))
     timeout = float(state.get("timeout_seconds") or 0)
     quiet = bool(state.get("quiet", False))
 
@@ -557,11 +547,12 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
         log_line(session_id, f"round {rounds + 1}: resuming session", quiet)
         process: subprocess.Popen | None = None
         try:
-            command = build_codex_command(session_id, prompt, cwd, approve_for_me)
+            command = build_codex_command(session_id, prompt)
             global _CURRENT_PROCESS
             process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
+                cwd=cwd,
                 stderr=subprocess.PIPE,
                 text=True,
             )
@@ -690,7 +681,6 @@ def cmd_start(args: argparse.Namespace) -> int:
             "max_backoff_ms": float(args.max_backoff_ms),
             "backoff_factor": float(args.backoff_factor),
             "poll_ms": float(args.poll_ms),
-            "approve_for_me": not args.no_approve_for_me,
             "timeout_seconds": float(args.timeout_seconds or 0),
             "quiet": bool(args.quiet),
         }
@@ -728,8 +718,6 @@ def cmd_start(args: argparse.Namespace) -> int:
     ]
     if state.get("until"):
         command += ["--until", state["until"]]
-    if not state.get("approve_for_me"):
-        command.append("--no-approve-for-me")
     if state.get("quiet"):
         command.append("--quiet")
 
@@ -918,7 +906,6 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--backoff-factor", type=float, default=2.0)
     start.add_argument("--poll-ms", type=float, default=2000, help="user-priority poll interval")
     start.add_argument("--timeout-seconds", type=float, default=0, help="max seconds per resume")
-    start.add_argument("--no-approve-for-me", action="store_true", help="do not pass --approve-for-me to codex")
     start.add_argument("--quiet", action="store_true")
     start.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
 

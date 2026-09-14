@@ -60,8 +60,8 @@ not as a brand-new request from the user:
 - Keep responses and tool results compact. If the context is tight, finish with
   a state summary and let the driver compact/retry; do not burn the budget by
   re-reading the whole history.
-- Use the tools and workspace normally; the loop does not change sandbox
-  policy by itself.
+- Use the tools and workspace normally; the loop does not change sandbox policy
+  by itself.
 
 ## Stopping
 
@@ -106,9 +106,8 @@ python3 "$SCRIPT" logs --dir "$PWD"
 ## Warnings
 
 An endless loop spends tokens until it is stopped. Use `--max-rounds`,
-`--until`, or the stop command to bound it. The default driver passes
-`--approve-for-me` to `codex exec resume` so approvals do not stall an
-unattended loop; pass `--no-approve-for-me` when the user wants to review every
-approval instead. The driver is designed for the same-session model: the app
-and the driver both append to the same session log, so avoid manually stopping
-or archiving during an active resume.
+`--until`, or the stop command to bound it. The driver uses only the flags
+accepted by the current `codex exec resume` implementation. The driver is
+designed for the same-session model: the app and the driver both append to the
+same session log, so avoid manually stopping or archiving during an active
+resume.

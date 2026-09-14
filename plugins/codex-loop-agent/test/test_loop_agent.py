@@ -158,6 +158,7 @@ class LoopAgentTests(unittest.TestCase):
         fake_codex.write_text(
             "#!/usr/bin/env python3\n"
             "import json, os, sys\n"
+            "assert os.getcwd() == os.environ['FAKE_CODEX_CWD']\n"
             "args = sys.argv[1:]\n"
             "prompt = args[3]\n"
             "path = os.environ['FAKE_SESSION_FILE']\n"
@@ -175,15 +176,15 @@ class LoopAgentTests(unittest.TestCase):
         fake_codex.chmod(0o755)
         session = session_file(self.sessions_root, SID, str(self.home))
         os.environ["FAKE_SESSION_FILE"] = str(session)
+        os.environ["FAKE_CODEX_CWD"] = str(self.home.resolve())
         state = loop_agent.load_state(SID)
         state.update(
             {
-                "cwd": str(self.home),
+                "cwd": str(self.home.resolve()),
                 "continuation": "继续",
                 "max_rounds": 1,
                 "poll_ms": 1,
                 "quiet": True,
-                "approve_for_me": False,
             }
         )
         rc = loop_agent.run_loop(SID, session, state)
@@ -195,12 +196,21 @@ class LoopAgentTests(unittest.TestCase):
         texts = [m["text"] for m in loop_agent.event_user_messages(events)]
         self.assertEqual(texts, ["original task", "继续"])
 
-    def test_build_codex_command_order(self):
-        command = loop_agent.build_codex_command(SID, "继续任务", Path("/tmp/project"), True)
-        self.assertIn(SID, command)
-        self.assertIn("继续任务", command)
-        self.assertLess(command.index("继续任务"), command.index("--cd"))
-        self.assertEqual(command[-1], "--approve-for-me")
+    def test_build_codex_command_uses_resume_compatible_flags(self):
+        command = loop_agent.build_codex_command(SID, "继续任务")
+        self.assertEqual(
+            command[1:],
+            [
+                "exec",
+                "resume",
+                SID,
+                "继续任务",
+                "--skip-git-repo-check",
+                "--json",
+            ],
+        )
+        for unsupported_flag in ("--cd", "--color", "--approve-for-me"):
+            self.assertNotIn(unsupported_flag, command)
 
 
 def set_codex_home(value):

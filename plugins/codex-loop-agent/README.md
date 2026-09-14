@@ -42,7 +42,6 @@ python3 scripts/loop-agent.py logs [--session <uuid> | --last | --dir <dir>] [--
 | `--max-backoff-ms` | `32000` | 退避上限 |
 | `--backoff-factor` | `2.0` | 指数退避乘数 |
 | `--poll-ms` | `2000` | 用户消息优先检查间隔 |
-| `--no-approve-for-me` | 默认关闭 | 不给 `codex exec resume` 传 `--approve-for-me` |
 
 ## 测试
 
