@@ -400,24 +400,48 @@ def resolve_session(
     )
 
 
-def event_user_messages(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = []
-    for event in events:
-        if event.get("type") != "event_msg":
-            continue
-        payload = event_payload(event)
-        if not payload or payload.get("type") != "user_message":
-            continue
+def _user_message_text(event: dict[str, Any], payload: dict[str, Any]) -> str | None:
+    event_type = event.get("type")
+    if event_type == "event_msg" and payload.get("type") == "user_message":
         text = payload.get("message")
         if text is None:
             text = payload.get("text")
+        return text if isinstance(text, str) else None
+    if (
+        event_type == "response_item"
+        and payload.get("type") == "message"
+        and payload.get("role") == "user"
+    ):
+        chunks: list[str] = []
+        content = payload.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, str):
+                    chunks.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text") or item.get("content")
+                    if isinstance(text, str):
+                        chunks.append(text)
+        if chunks:
+            return "\n".join(chunks)
+    return None
+
+
+def event_user_messages(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    for event in events:
+        payload = event_payload(event)
+        if not payload:
+            continue
+        text = _user_message_text(event, payload)
         if not isinstance(text, str) or not text.strip():
             continue
+        stripped = text.strip()
         timestamp = iso_to_epoch(event.get("timestamp")) or iso_to_epoch(
             payload.get("timestamp")
         )
         messages.append(
-            {"ts": timestamp, "text": text.strip(), "sha": sha256_text(text.strip())}
+            {"ts": timestamp, "text": stripped, "sha": sha256_text(stripped)}
         )
     return messages
 

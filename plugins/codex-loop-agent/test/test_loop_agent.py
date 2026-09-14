@@ -136,6 +136,46 @@ class LoopAgentTests(unittest.TestCase):
         self.assertEqual(loop_agent.event_user_messages(events)[0]["text"], "original task")
         self.assertGreater(loop_agent.last_completion_ts(events), 0)
 
+    def test_event_user_messages_reads_queue_response_items(self):
+        events = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-09-13T00:00:01.000Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "queued continuation",
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "event_msg",
+                "timestamp": "2026-09-13T00:00:02.000Z",
+                "payload": {
+                    "type": "user_message",
+                    "message": "classic user message",
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-09-13T00:00:03.000Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                },
+            },
+        ]
+        messages = loop_agent.event_user_messages(events)
+        self.assertEqual(
+            [m["text"] for m in messages],
+            ["queued continuation", "classic user message"],
+        )
+
     def test_current_object_payload_event_schema(self):
         path = self.sessions_root / "2026" / "09" / "13" / "rollout-object.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
