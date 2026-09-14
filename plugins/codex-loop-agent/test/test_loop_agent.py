@@ -102,6 +102,16 @@ class LoopAgentTests(unittest.TestCase):
             {"ts": 2.0, "text": "later request", "sha": "b"},
         ]
         self.assertEqual(loop_agent.original_task_text(messages), "first request")
+        self.assertEqual(
+            loop_agent.original_task_text(
+                [
+                    {"ts": 1.0, "text": "/forever", "sha": "a"},
+                    {"ts": 2.0, "text": "/stop", "sha": "b"},
+                    {"ts": 3.0, "text": "real task", "sha": "c"},
+                ]
+            ),
+            "real task",
+        )
 
     def test_is_stop_message(self):
         for text in (
@@ -193,6 +203,26 @@ class LoopAgentTests(unittest.TestCase):
         self.assertEqual(session_id, SID)
         self.assertEqual(path, old_path)
 
+
+    def test_last_without_cwd_uses_newest_session(self):
+        session_file(self.sessions_root, SID, "/tmp/project", mtime=1000)
+        newest = session_file(self.sessions_root, OTHER_SID, "/other", mtime=2000)
+        session_id, path = loop_agent.resolve_session(None, None, True)
+        self.assertEqual(session_id, OTHER_SID)
+        self.assertEqual(path, newest)
+
+    def test_last_with_cwd_keeps_cwd_scope(self):
+        newest = session_file(self.sessions_root, SID, "/tmp/project", mtime=1000)
+        session_file(self.sessions_root, OTHER_SID, "/other", mtime=2000)
+        session_id, path = loop_agent.resolve_session(None, "/tmp/project", True)
+        self.assertEqual(session_id, SID)
+        self.assertEqual(path, newest)
+
+    def test_last_with_unknown_cwd_fails(self):
+        session_file(self.sessions_root, SID, "/tmp/project", mtime=1000)
+        with self.assertRaises(RuntimeError):
+            loop_agent.resolve_session(None, "/tmp/missing", True)
+
     def test_explicit_session_wins(self):
         session_file(self.sessions_root, SID, "/tmp/old", mtime=1000)
         session_file(self.sessions_root, OTHER_SID, "/tmp/new", mtime=2000)
@@ -222,6 +252,30 @@ class LoopAgentTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             loop_agent.main(["config", "set", "continuation", "  "])
 
+    def test_config_rejects_unknown_key(self):
+        with self.assertRaises(SystemExit):
+            loop_agent.main(["config", "set", "bogus", "x"])
+
+    def test_is_same_process_detects_pid_reuse(self):
+        signature = loop_agent.process_start_signature(os.getpid())
+        self.assertIsNotNone(signature)
+        self.assertTrue(loop_agent.is_same_process(os.getpid(), signature))
+        self.assertFalse(
+            loop_agent.is_same_process(os.getpid(), "Mon Jan  1 00:00:00 1970")
+        )
+
+    def test_legacy_state_without_signature_uses_command_check(self):
+        with mock.patch.object(
+            loop_agent, "process_command_matches", return_value=True
+        ):
+            self.assertTrue(loop_agent.is_same_process(os.getpid(), None))
+        with mock.patch.object(
+            loop_agent, "process_command_matches", return_value=False
+        ):
+            self.assertFalse(loop_agent.is_same_process(os.getpid(), None))
+
+    def test_is_same_process_rejects_dead_pid(self):
+        self.assertFalse(loop_agent.is_same_process(os.getpid() + 1000000, None))
     def test_run_loop_completes_one_round_with_fake_codex(self):
         fake_codex = self.bin_dir / "codex"
         fake_codex.write_text(
@@ -434,7 +488,12 @@ class LoopAgentTests(unittest.TestCase):
         session = session_file(self.sessions_root, SID, "/tmp/session-cwd")
         args = loop_agent.build_parser().parse_args(["start", "--session", SID])
         idle = loop_agent.load_state(SID)
-        running = dict(idle, pid=os.getpid(), status="running")
+        running = dict(
+            idle,
+            pid=os.getpid(),
+            pid_started=loop_agent.process_start_signature(os.getpid()),
+            status="running",
+        )
         states = iter([idle])
         captured = {}
 
@@ -460,10 +519,147 @@ class LoopAgentTests(unittest.TestCase):
             loop_agent, "save_state", return_value=loop_agent.state_path(SID)
         ):
             rc = loop_agent.cmd_start(args)
+
         self.assertEqual(rc, 0)
         self.assertEqual(
             str(Path(captured["cwd"]).resolve()), str(Path("/tmp/session-cwd").resolve())
         )
+        self.assertIn("--dir-from-session", captured["command"])
+
+    def test_explicit_dir_wins_over_session_cwd(self):
+        session = session_file(self.sessions_root, SID, "/tmp/session-cwd")
+        explicit_dir = Path(self.tmp.name) / "explicit"
+        explicit_dir.mkdir()
+        args = loop_agent.build_parser().parse_args(
+            ["start", "--session", SID, "--dir", str(explicit_dir)]
+        )
+        idle = loop_agent.load_state(SID)
+        running = dict(
+            idle,
+            pid=os.getpid(),
+            pid_started=loop_agent.process_start_signature(os.getpid()),
+            status="running",
+        )
+        states = iter([idle])
+        captured = {}
+
+        class FakeProcess:
+            def poll(self):
+                return None
+
+        def capture(command, **kwargs):
+            captured["command"] = command
+            captured["cwd"] = kwargs["cwd"]
+            return FakeProcess()
+
+        def next_state(_sid):
+            return next(states, running)
+
+        with mock.patch.object(
+            loop_agent.subprocess, "Popen", side_effect=capture
+        ), mock.patch.object(
+            loop_agent, "resolve_session", return_value=(SID, session)
+        ), mock.patch.object(
+            loop_agent, "load_state", side_effect=next_state
+        ), mock.patch.object(
+            loop_agent, "save_state", return_value=loop_agent.state_path(SID)
+        ):
+            rc = loop_agent.cmd_start(args)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            str(Path(captured["cwd"]).resolve()), str(explicit_dir.resolve())
+        )
+
+    def test_start_last_without_dir_resolves_globally(self):
+        recent = session_file(self.sessions_root, OTHER_SID, "/other", mtime=2000)
+        args = loop_agent.build_parser().parse_args(["start", "--last"])
+        captured = {}
+
+        class FakeProcess:
+            def poll(self):
+                return None
+
+        def fake_resolve(session, cwd, last):
+            captured["resolve"] = (session, cwd, last)
+            return OTHER_SID, recent
+
+        def capture(command, **kwargs):
+            captured["cwd"] = kwargs["cwd"]
+            return FakeProcess()
+
+        idle = loop_agent.load_state(OTHER_SID)
+        running = dict(
+            idle,
+            pid=os.getpid(),
+            pid_started=loop_agent.process_start_signature(os.getpid()),
+            status="running",
+        )
+        states = iter([idle])
+
+        with mock.patch.object(
+            loop_agent.subprocess, "Popen", side_effect=capture
+        ), mock.patch.object(
+            loop_agent, "resolve_session", side_effect=fake_resolve
+        ), mock.patch.object(
+            loop_agent, "load_state", side_effect=lambda _sid: next(states, running)
+        ), mock.patch.object(
+            loop_agent, "save_state", return_value=loop_agent.state_path(OTHER_SID)
+        ):
+            rc = loop_agent.cmd_start(args)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["resolve"][1], None)
+        self.assertEqual(captured["resolve"][2], True)
+
+    def test_background_child_uses_session_cwd_marker(self):
+        session = session_file(self.sessions_root, SID, "/tmp/session-cwd")
+        args = loop_agent.build_parser().parse_args(
+            [
+                "start",
+                "--session",
+                SID,
+                "--dir",
+                str(self.home.resolve()),
+                "--dir-from-session",
+            ]
+        )
+        idle = loop_agent.load_state(SID)
+        running = dict(
+            idle,
+            pid=os.getpid(),
+            pid_started=loop_agent.process_start_signature(os.getpid()),
+            status="running",
+        )
+        states = iter([idle])
+        captured = {}
+
+        class FakeProcess:
+            def poll(self):
+                return None
+
+        def capture(command, **kwargs):
+            captured["cwd"] = kwargs["cwd"]
+            return FakeProcess()
+
+        def next_state(_sid):
+            return next(states, running)
+
+        with mock.patch.object(
+            loop_agent.subprocess, "Popen", side_effect=capture
+        ), mock.patch.object(
+            loop_agent, "resolve_session", return_value=(SID, session)
+        ), mock.patch.object(
+            loop_agent, "load_state", side_effect=next_state
+        ), mock.patch.object(
+            loop_agent, "save_state", return_value=loop_agent.state_path(SID)
+        ):
+            rc = loop_agent.cmd_start(args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            str(Path(captured["cwd"]).resolve()), str(Path("/tmp/session-cwd").resolve())
+        )
+
 
     def test_background_start_does_not_duplicate_log_lines(self):
         session = session_file(self.sessions_root, SID, str(self.home.resolve()))
@@ -481,7 +677,12 @@ class LoopAgentTests(unittest.TestCase):
             return FakeProcess()
 
         idle = loop_agent.load_state(SID)
-        running = dict(idle, pid=os.getpid(), status="running")
+        running = dict(
+            idle,
+            pid=os.getpid(),
+            pid_started=loop_agent.process_start_signature(os.getpid()),
+            status="running",
+        )
         states = iter([idle])
 
         def next_state(_sid):
@@ -563,6 +764,43 @@ class LoopAgentTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(calls), 1)
         self.assertEqual(loop_agent.load_state(SID)["status"], "stopped")
+
+    def test_run_loop_refreshes_state_updated_at_during_retries(self):
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "cwd": str(self.home.resolve()),
+                "continuation": "继续",
+                "poll_ms": 1,
+                "quiet": True,
+            }
+        )
+        loop_agent.save_state(SID, state)
+        observed = []
+
+        class FailProcess:
+            returncode = 1
+
+            def communicate(self, timeout=None):
+                return "", "transient failure"
+
+        def mark_stop(seconds):
+            observed.append(loop_agent.load_state(SID)["last_attempt_at"])
+            state["stop_requested"] = True
+            loop_agent.save_state(SID, state)
+
+        with mock.patch.object(
+            loop_agent.time, "sleep", side_effect=mark_stop
+        ), mock.patch.object(
+            loop_agent.subprocess, "Popen", return_value=FailProcess()
+        ):
+            rc = loop_agent.run_loop(SID, session, state)
+        self.assertEqual(rc, 0)
+        self.assertTrue(observed)
+        self.assertIsNotNone(observed[0])
+        self.assertEqual(loop_agent.load_state(SID)["last_error_kind"], "exit_nonzero")
+
 
     def test_build_codex_command_uses_resume_compatible_flags(self):
         command = loop_agent.build_codex_command(SID, "继续任务")

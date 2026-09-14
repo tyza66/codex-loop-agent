@@ -70,7 +70,7 @@ _CURRENT_PROCESS: subprocess.Popen | None = None
 # --------------------------------------------------------------------------
 
 def now_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace(
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds").replace(
         "+00:00", "Z"
     )
 
@@ -147,6 +147,7 @@ def load_state(session_id: str) -> dict[str, Any]:
         "status": "unknown",
         "rounds": 0,
         "started_at": None,
+        "pid_started": None,
         "updated_at": None,
         "stop_requested": False,
         "continuation": None,
@@ -196,6 +197,73 @@ def is_process_alive(pid: int | None) -> bool:
         return False
     except PermissionError:
         return True
+
+
+def _ps_field(pid: int | None, field: str) -> str | None:
+    if not pid or pid <= 0:
+        return None
+    read_fd, write_fd = os.pipe()
+    child: int | None = None
+    chunks: list[bytes] = []
+    try:
+        child = os.fork()
+        if child == 0:
+            try:
+                os.close(read_fd)
+                os.dup2(write_fd, 1)
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, 2)
+                os.execvp("ps", ["ps", "-p", str(pid), "-o", field])
+            except BaseException:
+                pass
+            os._exit(127)
+        os.close(write_fd)
+        write_fd = -1
+        while True:
+            chunk = os.read(read_fd, 4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except OSError:
+        return None
+    finally:
+        if child is not None and child != 0:
+            try:
+                os.waitpid(child, 0)
+            except OSError:
+                pass
+        for fd in (read_fd, write_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    value = b"".join(chunks).decode("utf-8", "ignore").strip()
+    return value or None
+
+
+def process_command_matches(pid: int | None) -> bool:
+    command = _ps_field(pid, "command=")
+    if not command:
+        return False
+    script = os.path.abspath(__file__)
+    return script in command or os.path.basename(script) in command
+
+
+def process_start_signature(pid: int | None) -> str | None:
+    return _ps_field(pid, "lstart=")
+
+
+def is_same_process(pid: int | None, pid_started: str | None) -> bool:
+    if not is_process_alive(pid):
+        return False
+    if not pid_started:
+        # Older state files predate pid_started; keep working, but only trust
+        # a live PID if we can still confirm it is the loop driver command.
+        return process_command_matches(pid)
+    signature = process_start_signature(pid)
+    if not signature:
+        return True
+    return str(pid_started) == signature
 
 
 def iso_to_epoch(value: Any) -> float:
@@ -314,6 +382,8 @@ def resolve_session(
             found = session_id_from_path(path)
             if found:
                 return found, path
+        if last:
+            raise RuntimeError(f"no session found for cwd {cwd}")
 
     if last or not cwd:
         path = files[0]
@@ -408,8 +478,12 @@ def last_assistant_text(events: list[dict[str, Any]], max_chars: int = 4000) -> 
 def original_task_text(messages: list[dict[str, Any]], max_chars: int = 1000) -> str:
     for message in messages:
         text = message.get("text")
-        if isinstance(text, str) and text.strip():
-            return text.strip()[:max_chars]
+        if not isinstance(text, str) or not text.strip():
+            continue
+        stripped = text.strip()
+        if is_stop_message(stripped) or stripped.lower().startswith("/forever"):
+            continue
+        return stripped[:max_chars]
     return ""
 
 
@@ -493,6 +567,7 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
 
     state["status"] = "running"
     state["pid"] = os.getpid()
+    state["pid_started"] = process_start_signature(os.getpid())
     save_state(session_id, state)
 
     sent_hashes = set(state.get("sent_hashes") or [])
@@ -503,13 +578,23 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
 
     log_line(session_id, f"loop started for session {session_id}", quiet)
 
-    def stop_loop(reason: str) -> int:
-        state["stop_requested"] = True
-        state["status"] = "stopped"
+    def persist_progress(status: str = "running") -> None:
+        state["status"] = status
         state["sent_hashes"] = sorted(sent_hashes)
         state["rounds"] = rounds
         state["last_completion_ts"] = last_completion
         save_state(session_id, state)
+
+    def note_error(kind: str, detail: str) -> None:
+        state["last_error_kind"] = kind
+        state["last_error"] = detail[-800:]
+        state["last_attempt_at"] = now_iso()
+        persist_progress()
+
+    def stop_loop(reason: str) -> int:
+        state["stop_requested"] = True
+        state["stop_reason"] = reason
+        persist_progress("stopped")
         log_line(session_id, f"loop stopped: {reason}", quiet)
         return 0
 
@@ -519,8 +604,7 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
             return stop_loop("stop requested via state file")
 
         if load_global_config().get("disabled"):
-            state["status"] = "disabled"
-            save_state(session_id, state)
+            persist_progress("disabled")
             log_line(
                 session_id,
                 "global endless-loop switch is off; use `config enable` to turn it back on",
@@ -529,11 +613,7 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
             return 0
 
         if max_rounds and rounds >= max_rounds:
-            state["status"] = "completed"
-            state["sent_hashes"] = sorted(sent_hashes)
-            state["rounds"] = rounds
-            state["last_completion_ts"] = last_completion
-            save_state(session_id, state)
+            persist_progress("completed")
             log_line(session_id, f"loop completed after {rounds} round(s)", quiet)
             return 0
 
@@ -559,6 +639,7 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
                     "a real user message is pending; waiting for that turn to finish",
                     quiet,
                 )
+                persist_progress()
                 time.sleep(poll_seconds)
                 continue
 
@@ -571,6 +652,8 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
         )
 
         log_line(session_id, f"round {rounds + 1}: resuming session", quiet)
+        state["last_attempt_at"] = now_iso()
+        persist_progress()
         process: subprocess.Popen | None = None
         try:
             command = build_codex_command(session_id, prompt)
@@ -600,13 +683,14 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
                 process.kill()
                 process.wait()
             log_line(session_id, error, quiet)
+            note_error("timeout", error)
             failed_prompt = prompt
             time.sleep(backoff)
             backoff = min(max_backoff, backoff * backoff_factor)
             continue
+        except (KeyboardInterrupt, SystemExit):
+            raise
         except BaseException as exc:
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                raise
             if process is not None and process.poll() is None:
                 try:
                     process.kill()
@@ -620,6 +704,7 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
                 quiet,
             )
             failed_prompt = prompt
+            note_error("spawn_error", detail)
             log_line(
                 session_id,
                 f"retrying same continuation in {int(backoff * 1000)}ms",
@@ -635,22 +720,26 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
             last_completion = max(last_completion, time.time())
             backoff = initial_backoff
             failed_prompt = None
-            state["rounds"] = rounds
-            state["sent_hashes"] = sorted(sent_hashes)
-            state["last_completion_ts"] = last_completion
-            state["status"] = "running"
-            save_state(session_id, state)
+            state.pop("last_error_kind", None)
+            state.pop("last_error", None)
+            persist_progress()
             log_line(session_id, f"round {rounds} finished", quiet)
             time.sleep(poll_seconds)
             continue
 
-        error_tail = (result.stderr or result.stdout or "")[-800:]
+        error_tail = (result.stderr or result.stdout or "").strip()
+        lowered = error_tail.lower()
+        error_kind = "exit_nonzero"
+        if "already has an active writer" in lowered:
+            error_kind = "active_writer"
+        elif any(marker in lowered for marker in CONTEXT_ERROR_MARKERS):
+            error_kind = "context_pressure"
+        summary = error_tail[-400:].replace("\n", " ")
         log_line(
             session_id,
-            f"round failed (exit {result.returncode}): {error_tail}",
+            f"round failed (exit {result.returncode}, {error_kind}): {summary}",
             quiet,
         )
-        lowered = error_tail.lower()
         if "already has an active writer" in lowered:
             log_line(
                 session_id,
@@ -665,6 +754,7 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
                 quiet,
             )
         failed_prompt = prompt
+        note_error(error_kind, error_tail)
         log_line(
             session_id,
             f"retrying same continuation in {int(backoff * 1000)}ms",
@@ -695,18 +785,20 @@ def _signal_handler(signum: int, frame: Any) -> None:
 # --------------------------------------------------------------------------
 
 def cmd_start(args: argparse.Namespace) -> int:
-    requested_cwd = Path(args.dir).expanduser().resolve()
+    requested_cwd = Path(args.dir or os.getcwd()).expanduser().resolve()
+    dir_from_session = bool(getattr(args, "dir_from_session", False))
+    explicit_dir = args.dir is not None and not dir_from_session
+    selector_only = bool(args.session or args.last) and not explicit_dir
+    resolve_cwd = None if selector_only else str(requested_cwd)
     session_id, session_file = resolve_session(
-        args.session, str(requested_cwd), args.last
+        args.session,
+        resolve_cwd,
+        args.last,
     )
     recorded_cwd = session_cwd(session_file)
-    if args.session or args.last:
-        selected_cwd = (
-            Path(recorded_cwd).expanduser().resolve()
-            if recorded_cwd
-            else requested_cwd
-        )
-    elif recorded_cwd and str(requested_cwd) == str(Path.cwd().resolve()):
+    if args.dir is not None and not dir_from_session:
+        selected_cwd = requested_cwd
+    elif recorded_cwd:
         selected_cwd = Path(recorded_cwd).expanduser().resolve()
     else:
         selected_cwd = requested_cwd
@@ -715,7 +807,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     existing = load_state(session_id)
     if (
         existing.get("pid")
-        and is_process_alive(existing.get("pid"))
+        and is_same_process(existing.get("pid"), existing.get("pid_started"))
         and not args.foreground
     ):
         print(
@@ -788,6 +880,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     if state.get("quiet"):
         command.append("--quiet")
 
+    command.append("--dir-from-session")
+
     process = subprocess.Popen(
         command,
         cwd=str(cwd),
@@ -800,7 +894,9 @@ def cmd_start(args: argparse.Namespace) -> int:
     deadline = time.time() + 5.0
     while time.time() < deadline:
         current = load_state(session_id)
-        if current.get("pid") and is_process_alive(current.get("pid")):
+        if current.get("pid") and is_same_process(
+            current.get("pid"), current.get("pid_started")
+        ):
             print(f"endless loop started for session {session_id} (pid {current['pid']})")
             print(f"log: {log_path(session_id)}")
             print("stop with: `codex-loop-agent stop --session <session-id>` or send /stop in the thread")
@@ -841,7 +937,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
         state["status"] = "stopped"
         save_state(session_id, state)
         pid = state.get("pid")
-        if pid and is_process_alive(pid):
+        if pid and is_same_process(pid, state.get("pid_started")):
             pid_int = int(pid)
             os.kill(pid_int, signal.SIGTERM)
             deadline = time.time() + (0.5 if args.force else 3.0)
@@ -886,8 +982,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         rows.append(
             {
                 "session": session_id,
-                "running": is_process_alive(state.get("pid"))
-                and state.get("status") == "running",
+                "running": is_same_process(
+                    state.get("pid"), state.get("pid_started")
+                ),
                 "status": state.get("status"),
                 "rounds": state.get("rounds"),
                 "pid": state.get("pid"),
@@ -934,6 +1031,10 @@ def cmd_config(args: argparse.Namespace) -> int:
     elif args.action == "set":
         key = args.key
         value: Any = args.value
+        if key not in ("continuation", "disabled"):
+            raise SystemExit(
+                f"unknown config key {key!r}; expected continuation or disabled"
+            )
         if key == "continuation":
             value = str(value).strip()
             if not value:
@@ -948,8 +1049,7 @@ def cmd_config(args: argparse.Namespace) -> int:
                 raise SystemExit(
                     "`disabled` expects true/false/on/off; use `config enable` or `config disable`"
                 )
-        else:
-            config[key] = value
+        config[key] = value
     saved = save_global_config(config)
     print(json.dumps(config, ensure_ascii=False, indent=2))
     print(f"# saved to {saved}")
@@ -977,7 +1077,12 @@ def build_parser() -> argparse.ArgumentParser:
     start = subparsers.add_parser("start", help="start an endless loop for a Codex session")
     start.add_argument("--session", help="session UUID; omit to auto-resolve by --dir")
     start.add_argument("--last", action="store_true", help="use the newest session")
-    start.add_argument("--dir", default=os.getcwd(), help="working directory for the loop")
+    start.add_argument(
+        "--dir",
+        default=None,
+        dest="dir",
+        help="working directory for the loop",
+    )
     start.add_argument("--continuation", help="continuation prompt template")
     start.add_argument("--max-rounds", type=int, default=0, help="stop after N continuation rounds (0 = unlimited)")
     start.add_argument("--until", help="stop at an ISO time or unix epoch")
@@ -988,6 +1093,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--timeout-seconds", type=float, default=0, help="max seconds per resume")
     start.add_argument("--quiet", action="store_true")
     start.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
+    start.add_argument("--dir-from-session", action="store_true", help=argparse.SUPPRESS)
 
     stop = subparsers.add_parser("stop", help="stop an endless loop")
     stop.add_argument("--session")
