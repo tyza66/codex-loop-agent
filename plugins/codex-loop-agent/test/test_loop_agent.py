@@ -96,6 +96,13 @@ class LoopAgentTests(unittest.TestCase):
         self.assertIn("第 3 轮", rendered)
         self.assertIn("任务 测试任务", rendered)
 
+    def test_original_task_uses_first_user_message(self):
+        messages = [
+            {"ts": 1.0, "text": "first request", "sha": "a"},
+            {"ts": 2.0, "text": "later request", "sha": "b"},
+        ]
+        self.assertEqual(loop_agent.original_task_text(messages), "first request")
+
     def test_is_stop_message(self):
         for text in (
             "/stop",
@@ -211,6 +218,10 @@ class LoopAgentTests(unittest.TestCase):
         self.assertTrue(path.exists())
         self.assertEqual(loop_agent.load_global_config()["continuation"], "继续")
 
+    def test_config_rejects_empty_continuation(self):
+        with self.assertRaises(SystemExit):
+            loop_agent.main(["config", "set", "continuation", "  "])
+
     def test_run_loop_completes_one_round_with_fake_codex(self):
         fake_codex = self.bin_dir / "codex"
         fake_codex.write_text(
@@ -289,6 +300,205 @@ class LoopAgentTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(captured["stdout"], loop_agent.subprocess.DEVNULL)
 
+    def test_run_loop_retries_after_generic_resume_error(self):
+        fake_codex = self.bin_dir / "codex"
+        fake_codex.write_text("#!/usr/bin/env python3\nsys.exit(0)\n")
+        fake_codex.chmod(0o755)
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "cwd": str(self.home.resolve()),
+                "continuation": "继续",
+                "poll_ms": 1,
+                "quiet": True,
+            }
+        )
+        calls = []
+
+        def flaky(*args, **kwargs):
+            calls.append(1)
+            raise OSError("boom")
+
+        def mark_stop(seconds):
+            state["stop_requested"] = True
+            loop_agent.save_state(SID, state)
+
+        with mock.patch.object(
+            loop_agent.time, "sleep", side_effect=mark_stop
+        ), mock.patch.object(
+            loop_agent.subprocess, "Popen", side_effect=flaky
+        ):
+            rc = loop_agent.run_loop(SID, session, state)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(rc, 0)
+        self.assertEqual(loop_agent.load_state(SID)["status"], "stopped")
+
+    def test_run_loop_waits_after_killing_timed_out_codex(self):
+        fake_codex = self.bin_dir / "codex"
+        fake_codex.write_text("#!/usr/bin/env python3\nsys.exit(0)\n")
+        fake_codex.chmod(0o755)
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "cwd": str(self.home.resolve()),
+                "continuation": "继续",
+                "poll_ms": 1,
+                "quiet": True,
+            }
+        )
+
+        class FakeProcess:
+            killed = False
+            waited = False
+
+            def communicate(self, timeout=None):
+                raise loop_agent.subprocess.TimeoutExpired(
+                    "codex", timeout=timeout
+                )
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.killed = True
+
+            def wait(self):
+                self.waited = True
+                return -9
+
+        fake_process = FakeProcess()
+
+        def mark_stop(seconds):
+            state["stop_requested"] = True
+            loop_agent.save_state(SID, state)
+
+        with mock.patch.object(
+            loop_agent.time, "sleep", side_effect=mark_stop
+        ), mock.patch.object(
+            loop_agent.subprocess, "Popen", return_value=fake_process
+        ):
+            rc = loop_agent.run_loop(SID, session, state)
+        self.assertTrue(fake_process.killed)
+        self.assertTrue(fake_process.waited)
+        self.assertEqual(rc, 0)
+
+    def test_interrupted_turn_is_retried_not_treated_as_stop(self):
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        with session.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "timestamp": "2026-09-13T00:00:05.000Z",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "turn_aborted",
+                            "reason": "interrupted",
+                        },
+                    }
+                )
+                + "\n"
+            )
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "cwd": str(self.home.resolve()),
+                "continuation": "继续",
+                "poll_ms": 1,
+                "quiet": True,
+            }
+        )
+
+        class FakeProcess:
+            returncode = 1
+
+            def communicate(self, timeout=None):
+                return "", "transient failure"
+
+        def mark_stop(seconds):
+            state["stop_requested"] = True
+            loop_agent.save_state(SID, state)
+
+        with mock.patch.object(
+            loop_agent.time, "sleep", side_effect=mark_stop
+        ), mock.patch.object(
+            loop_agent.subprocess, "Popen", return_value=FakeProcess()
+        ):
+            rc = loop_agent.run_loop(SID, session, state)
+        self.assertEqual(rc, 0)
+        final = loop_agent.load_state(SID)
+        self.assertEqual(final["status"], "stopped")
+
+    def test_start_uses_session_cwd_even_when_dir_is_default(self):
+        session = session_file(self.sessions_root, SID, "/tmp/session-cwd")
+        args = loop_agent.build_parser().parse_args(["start", "--session", SID])
+        idle = loop_agent.load_state(SID)
+        running = dict(idle, pid=os.getpid(), status="running")
+        states = iter([idle])
+        captured = {}
+
+        class FakeProcess:
+            def poll(self):
+                return None
+
+        def capture(command, **kwargs):
+            captured["command"] = command
+            captured["cwd"] = kwargs["cwd"]
+            return FakeProcess()
+
+        def next_state(_sid):
+            return next(states, running)
+
+        with mock.patch.object(
+            loop_agent.subprocess, "Popen", side_effect=capture
+        ), mock.patch.object(
+            loop_agent, "resolve_session", return_value=(SID, session)
+        ), mock.patch.object(
+            loop_agent, "load_state", side_effect=next_state
+        ), mock.patch.object(
+            loop_agent, "save_state", return_value=loop_agent.state_path(SID)
+        ):
+            rc = loop_agent.cmd_start(args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            str(Path(captured["cwd"]).resolve()), str(Path("/tmp/session-cwd").resolve())
+        )
+
+    def test_background_start_does_not_duplicate_log_lines(self):
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        args = loop_agent.build_parser().parse_args(
+            ["start", "--session", SID, "--dir", str(self.home.resolve())]
+        )
+        captured = {}
+
+        class FakeProcess:
+            def poll(self):
+                return None
+
+        def capture(command, **kwargs):
+            captured.update(kwargs)
+            return FakeProcess()
+
+        idle = loop_agent.load_state(SID)
+        running = dict(idle, pid=os.getpid(), status="running")
+        states = iter([idle])
+
+        def next_state(_sid):
+            return next(states, running)
+
+        with mock.patch.object(
+            loop_agent.subprocess, "Popen", side_effect=capture
+        ), mock.patch.object(
+            loop_agent, "resolve_session", return_value=(SID, session)
+        ), mock.patch.object(
+            loop_agent, "load_state", side_effect=next_state
+        ):
+            rc = loop_agent.cmd_start(args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["stderr"], loop_agent.subprocess.DEVNULL)
+        self.assertEqual(captured["stdout"], loop_agent.subprocess.DEVNULL)
+
     def test_run_loop_stops_when_session_file_is_missing(self):
         session = session_file(self.sessions_root, SID, str(self.home.resolve()))
         state = loop_agent.load_state(SID)
@@ -310,7 +520,7 @@ class LoopAgentTests(unittest.TestCase):
         self.assertEqual(final["status"], "stopped")
         self.assertTrue(final["stop_requested"])
 
-    def test_run_loop_stops_when_latest_terminal_event_is_aborted(self):
+    def test_run_loop_retries_when_latest_terminal_event_is_aborted(self):
         session = session_file(self.sessions_root, SID, str(self.home.resolve()))
         with session.open("a", encoding="utf-8") as handle:
             handle.write(
@@ -334,14 +544,25 @@ class LoopAgentTests(unittest.TestCase):
                 "quiet": True,
             }
         )
+        calls = []
+
+        def flaky(*args, **kwargs):
+            calls.append(1)
+            raise OSError("boom")
+
+        def mark_stop(seconds):
+            state["stop_requested"] = True
+            loop_agent.save_state(SID, state)
+
         with mock.patch.object(
-            loop_agent.subprocess, "Popen", side_effect=AssertionError("should not resume")
+            loop_agent.time, "sleep", side_effect=mark_stop
+        ), mock.patch.object(
+            loop_agent.subprocess, "Popen", side_effect=flaky
         ):
             rc = loop_agent.run_loop(SID, session, state)
         self.assertEqual(rc, 0)
-        final = loop_agent.load_state(SID)
-        self.assertEqual(final["status"], "stopped")
-        self.assertTrue(final["stop_requested"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(loop_agent.load_state(SID)["status"], "stopped")
 
     def test_build_codex_command_uses_resume_compatible_flags(self):
         command = loop_agent.build_codex_command(SID, "继续任务")

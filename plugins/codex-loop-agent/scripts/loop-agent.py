@@ -405,6 +405,14 @@ def last_assistant_text(events: list[dict[str, Any]], max_chars: int = 4000) -> 
     return ""
 
 
+def original_task_text(messages: list[dict[str, Any]], max_chars: int = 1000) -> str:
+    for message in messages:
+        text = message.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()[:max_chars]
+    return ""
+
+
 def render_continuation(
     template: str,
     last_answer: str = "",
@@ -536,8 +544,6 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
         if not session_file.exists():
             return stop_loop("session file was archived or deleted")
         last_completion = max(last_completion, last_completion_ts(events))
-        if last_aborted_ts(events) > last_completion:
-            return stop_loop("thread turn was stopped")
         messages = event_user_messages(events)
 
         humans = [m for m in messages if m["sha"] not in sent_hashes]
@@ -557,10 +563,11 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
                 continue
 
         last_answer = last_assistant_text(events)
+        task = original_task_text(messages)
         prompt = (
             failed_prompt
             if failed_prompt is not None
-            else render_continuation(continuation, last_answer, rounds + 1)
+            else render_continuation(continuation, last_answer, rounds + 1, task)
         )
 
         log_line(session_id, f"round {rounds + 1}: resuming session", quiet)
@@ -585,19 +592,39 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
             result = subprocess.CompletedProcess(
                 command, process.returncode, stdout, stderr
             )
-        except FileNotFoundError as exc:
-            log_line(session_id, f"codex command failed to start: {exc}", quiet)
-            time.sleep(backoff)
-            backoff = min(max_backoff, backoff * backoff_factor)
-            continue
         except subprocess.TimeoutExpired as exc:
             error = f"codex resume timed out after {timeout}s"
             if exc.stderr:
                 error += f": {str(exc.stderr)[-400:]}"
             if process is not None and process.poll() is None:
                 process.kill()
+                process.wait()
             log_line(session_id, error, quiet)
             failed_prompt = prompt
+            time.sleep(backoff)
+            backoff = min(max_backoff, backoff * backoff_factor)
+            continue
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            if process is not None and process.poll() is None:
+                try:
+                    process.kill()
+                    process.wait()
+                except OSError:
+                    pass
+            detail = str(exc).strip() or exc.__class__.__name__
+            log_line(
+                session_id,
+                f"codex resume failed ({exc.__class__.__name__}): {detail}",
+                quiet,
+            )
+            failed_prompt = prompt
+            log_line(
+                session_id,
+                f"retrying same continuation in {int(backoff * 1000)}ms",
+                quiet,
+            )
             time.sleep(backoff)
             backoff = min(max_backoff, backoff * backoff_factor)
             continue
@@ -661,8 +688,22 @@ def _signal_handler(signum: int, frame: Any) -> None:
 # --------------------------------------------------------------------------
 
 def cmd_start(args: argparse.Namespace) -> int:
-    cwd = Path(args.dir).expanduser().resolve()
-    session_id, session_file = resolve_session(args.session, str(cwd), args.last)
+    requested_cwd = Path(args.dir).expanduser().resolve()
+    session_id, session_file = resolve_session(
+        args.session, str(requested_cwd), args.last
+    )
+    recorded_cwd = session_cwd(session_file)
+    if args.session or args.last:
+        selected_cwd = (
+            Path(recorded_cwd).expanduser().resolve()
+            if recorded_cwd
+            else requested_cwd
+        )
+    elif recorded_cwd and str(requested_cwd) == str(Path.cwd().resolve()):
+        selected_cwd = Path(recorded_cwd).expanduser().resolve()
+    else:
+        selected_cwd = requested_cwd
+    cwd = selected_cwd
 
     existing = load_state(session_id)
     if (
@@ -740,18 +781,14 @@ def cmd_start(args: argparse.Namespace) -> int:
     if state.get("quiet"):
         command.append("--quiet")
 
-    log_handle = open(log_path(session_id), "a", encoding="utf-8")
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=str(cwd),
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    finally:
-        log_handle.close()
+    process = subprocess.Popen(
+        command,
+        cwd=str(cwd),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
     deadline = time.time() + 5.0
     while time.time() < deadline:
@@ -798,11 +835,24 @@ def cmd_stop(args: argparse.Namespace) -> int:
         save_state(session_id, state)
         pid = state.get("pid")
         if pid and is_process_alive(pid):
-            os.kill(int(pid), signal.SIGTERM)
-            if args.force:
-                time.sleep(0.5)
-                if is_process_alive(pid):
-                    os.kill(int(pid), signal.SIGKILL)
+            pid_int = int(pid)
+            os.kill(pid_int, signal.SIGTERM)
+            deadline = time.time() + (0.5 if args.force else 3.0)
+            while time.time() < deadline and is_process_alive(pid_int):
+                try:
+                    waited, _status = os.waitpid(pid_int, os.WNOHANG)
+                    if waited:
+                        break
+                except ChildProcessError:
+                    if not is_process_alive(pid_int):
+                        break
+                time.sleep(0.05)
+            if args.force and is_process_alive(pid_int):
+                os.kill(pid_int, signal.SIGKILL)
+                try:
+                    os.waitpid(pid_int, 0)
+                except ChildProcessError:
+                    pass
             print(f"stopped loop {session_id} (pid {pid})")
         else:
             print(f"marked loop {session_id} as stopped")
@@ -877,6 +927,10 @@ def cmd_config(args: argparse.Namespace) -> int:
     elif args.action == "set":
         key = args.key
         value: Any = args.value
+        if key == "continuation":
+            value = str(value).strip()
+            if not value:
+                raise SystemExit("`continuation` cannot be empty")
         if key == "disabled":
             lowered = str(value).strip().lower()
             if lowered in ("true", "1", "on", "yes"):
