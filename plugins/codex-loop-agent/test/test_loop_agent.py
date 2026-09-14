@@ -240,6 +240,41 @@ class LoopAgentTests(unittest.TestCase):
         self.assertEqual(pending["text"], "user: wait")
         self.assertIsNone(loop_agent.pending_human_message(messages, sent, 20.0))
 
+    def test_run_loop_detects_stop_even_when_not_latest_message(self):
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        with session.open("a", encoding="utf-8") as handle:
+            for ts, msg in (
+                ("2026-09-13T00:00:10.000Z", "/stop"),
+                ("2026-09-13T00:00:11.000Z", "继续"),
+            ):
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "timestamp": ts,
+                            "payload": {"type": "user_message", "message": msg},
+                        }
+                    )
+                    + "\n"
+                )
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "cwd": str(self.home.resolve()),
+                "continuation": "继续",
+                "poll_ms": 1,
+                "quiet": True,
+            }
+        )
+        with mock.patch.object(
+            loop_agent.subprocess, "Popen", side_effect=AssertionError("must not resume")
+        ):
+            rc = loop_agent.run_loop(SID, session, state)
+        self.assertEqual(rc, 0)
+        final = loop_agent.load_state(SID)
+        self.assertEqual(final["status"], "stopped")
+        self.assertTrue(final["stop_requested"])
+
     def test_global_config_round_trip(self):
         config = loop_agent.load_global_config()
         self.assertFalse(config["disabled"])
@@ -256,13 +291,31 @@ class LoopAgentTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             loop_agent.main(["config", "set", "bogus", "x"])
 
+    def test_is_same_process_matches_expected_signature(self):
+        with mock.patch.object(
+            loop_agent, "process_start_signature", return_value="sig-current"
+        ):
+            self.assertTrue(
+                loop_agent.is_same_process(os.getpid(), "sig-current")
+            )
+
     def test_is_same_process_detects_pid_reuse(self):
-        signature = loop_agent.process_start_signature(os.getpid())
-        self.assertIsNotNone(signature)
-        self.assertTrue(loop_agent.is_same_process(os.getpid(), signature))
-        self.assertFalse(
-            loop_agent.is_same_process(os.getpid(), "Mon Jan  1 00:00:00 1970")
-        )
+        with mock.patch.object(
+            loop_agent, "process_start_signature", return_value="sig-current"
+        ):
+            self.assertFalse(
+                loop_agent.is_same_process(
+                    os.getpid(), "Mon Jan  1 00:00:00 1970"
+                )
+            )
+
+    def test_is_same_process_without_signature_is_not_a_match(self):
+        with mock.patch.object(
+            loop_agent, "process_start_signature", return_value=None
+        ):
+            self.assertFalse(
+                loop_agent.is_same_process(os.getpid(), "sig-recorded")
+            )
 
     def test_legacy_state_without_signature_uses_command_check(self):
         with mock.patch.object(
@@ -491,13 +544,14 @@ class LoopAgentTests(unittest.TestCase):
         running = dict(
             idle,
             pid=os.getpid(),
-            pid_started=loop_agent.process_start_signature(os.getpid()),
+            pid_started="test-signature",
             status="running",
         )
         states = iter([idle])
         captured = {}
 
         class FakeProcess:
+            pid = os.getpid()
             def poll(self):
                 return None
 
@@ -537,13 +591,14 @@ class LoopAgentTests(unittest.TestCase):
         running = dict(
             idle,
             pid=os.getpid(),
-            pid_started=loop_agent.process_start_signature(os.getpid()),
+            pid_started="test-signature",
             status="running",
         )
         states = iter([idle])
         captured = {}
 
         class FakeProcess:
+            pid = os.getpid()
             def poll(self):
                 return None
 
@@ -577,6 +632,7 @@ class LoopAgentTests(unittest.TestCase):
         captured = {}
 
         class FakeProcess:
+            pid = os.getpid()
             def poll(self):
                 return None
 
@@ -592,7 +648,7 @@ class LoopAgentTests(unittest.TestCase):
         running = dict(
             idle,
             pid=os.getpid(),
-            pid_started=loop_agent.process_start_signature(os.getpid()),
+            pid_started="test-signature",
             status="running",
         )
         states = iter([idle])
@@ -628,13 +684,14 @@ class LoopAgentTests(unittest.TestCase):
         running = dict(
             idle,
             pid=os.getpid(),
-            pid_started=loop_agent.process_start_signature(os.getpid()),
+            pid_started="test-signature",
             status="running",
         )
         states = iter([idle])
         captured = {}
 
         class FakeProcess:
+            pid = os.getpid()
             def poll(self):
                 return None
 
@@ -669,6 +726,7 @@ class LoopAgentTests(unittest.TestCase):
         captured = {}
 
         class FakeProcess:
+            pid = os.getpid()
             def poll(self):
                 return None
 
@@ -680,7 +738,7 @@ class LoopAgentTests(unittest.TestCase):
         running = dict(
             idle,
             pid=os.getpid(),
-            pid_started=loop_agent.process_start_signature(os.getpid()),
+            pid_started="test-signature",
             status="running",
         )
         states = iter([idle])

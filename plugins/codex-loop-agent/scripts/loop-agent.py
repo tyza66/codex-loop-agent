@@ -257,12 +257,15 @@ def is_same_process(pid: int | None, pid_started: str | None) -> bool:
     if not is_process_alive(pid):
         return False
     if not pid_started:
-        # Older state files predate pid_started; keep working, but only trust
-        # a live PID if we can still confirm it is the loop driver command.
+        # Older state files predate pid_started; only trust a live PID when the
+        # command line can still be confirmed as the loop driver.
         return process_command_matches(pid)
     signature = process_start_signature(pid)
     if not signature:
-        return True
+        # We cannot verify the identity (for example `ps` is blocked). Never
+        # claim a match we cannot prove; callers that must kill a PID use the
+        # separate liveness check with explicit user intent instead.
+        return False
     return str(pid_started) == signature
 
 
@@ -629,10 +632,11 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
         humans = [m for m in messages if m["sha"] not in sent_hashes]
         loops = [m for m in messages if m["sha"] in sent_hashes]
         latest_loop_ts = loops[-1]["ts"] if loops else 0.0
+        for human in humans:
+            if human["ts"] > latest_loop_ts and is_stop_message(human["text"]):
+                return stop_loop("user sent a stop message")
         if humans and humans[-1]["ts"] > latest_loop_ts:
             latest_human = humans[-1]
-            if is_stop_message(latest_human["text"]):
-                return stop_loop("user sent a stop message")
             if latest_human["ts"] > last_completion:
                 log_line(
                     session_id,
@@ -807,7 +811,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     existing = load_state(session_id)
     if (
         existing.get("pid")
-        and is_same_process(existing.get("pid"), existing.get("pid_started"))
+        and existing.get("status") == "running"
+        and is_process_alive(existing.get("pid"))
         and not args.foreground
     ):
         print(
@@ -891,11 +896,14 @@ def cmd_start(args: argparse.Namespace) -> int:
         start_new_session=True,
     )
 
+    spawned_pid = process.pid
     deadline = time.time() + 5.0
     while time.time() < deadline:
         current = load_state(session_id)
-        if current.get("pid") and is_same_process(
-            current.get("pid"), current.get("pid_started")
+        if (
+            current.get("pid")
+            and int(current.get("pid")) == int(spawned_pid)
+            and is_process_alive(spawned_pid)
         ):
             print(f"endless loop started for session {session_id} (pid {current['pid']})")
             print(f"log: {log_path(session_id)}")
@@ -937,7 +945,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
         state["status"] = "stopped"
         save_state(session_id, state)
         pid = state.get("pid")
-        if pid and is_same_process(pid, state.get("pid_started")):
+        if pid and is_process_alive(pid):
             pid_int = int(pid)
             os.kill(pid_int, signal.SIGTERM)
             deadline = time.time() + (0.5 if args.force else 3.0)
@@ -982,8 +990,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         rows.append(
             {
                 "session": session_id,
-                "running": is_same_process(
-                    state.get("pid"), state.get("pid_started")
+                "running": bool(
+                    state.get("status") == "running"
+                    and is_process_alive(state.get("pid"))
                 ),
                 "status": state.get("status"),
                 "rounds": state.get("rounds"),
