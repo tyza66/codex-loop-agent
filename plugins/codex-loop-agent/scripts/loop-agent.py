@@ -651,6 +651,13 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
             quiet,
         )
         lowered = error_tail.lower()
+        if "already has an active writer" in lowered:
+            log_line(
+                session_id,
+                "the Codex app currently holds this thread's writer lock; "
+                "CLI resume cannot run concurrently, so the loop will keep retrying",
+                quiet,
+            )
         if any(marker in lowered for marker in CONTEXT_ERROR_MARKERS):
             log_line(
                 session_id,
