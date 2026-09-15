@@ -1421,6 +1421,107 @@ class LoopAgentTests(unittest.TestCase):
         self.assertEqual(final.get("queued_item_ids") or [], [])
         self.assertTrue(final.get("stop_requested"))
 
+    def test_parse_queued_item_id_extracts_uuid_and_ignores_junk(self):
+        item_id = "01a0a289-38e9-7672-8e04-9fd60b3cff94"
+        self.assertEqual(
+            loop_agent.parse_queued_item_id(
+                f"Queued message {item_id} for thread abc."
+            ),
+            item_id,
+        )
+        # The driver relies on this parse to track its own continuation;
+        # unparsable output must stay None rather than inventing an id.
+        for text in ("", "unrelated output", "Queued message  for thread x."):
+            self.assertIsNone(loop_agent.parse_queued_item_id(text), text)
+
+    def test_parse_until_accepts_iso_and_epoch_and_rejects_junk(self):
+        self.assertIsNone(loop_agent.parse_until(None))
+        self.assertIsNone(loop_agent.parse_until(""))
+        self.assertEqual(loop_agent.parse_until("1789257600"), 1789257600.0)
+        self.assertEqual(
+            loop_agent.parse_until("2026-09-13T00:00:00.000Z"),
+            1789257600.0,
+        )
+        with self.assertRaises(ValueError):
+            loop_agent.parse_until("not-a-time")
+
+    def test_queued_payload_text_collects_real_user_input(self):
+        payload = json.dumps(
+            {
+                "UserInput": {
+                    "content": [
+                        {"type": "text", "text": "继续", "text_elements": []}
+                    ],
+                    "client_id": "abc",
+                }
+            }
+        )
+        self.assertEqual(loop_agent.queued_payload_text(payload), "继续")
+        # Malformed payloads degrade to an empty string instead of raising.
+        for bad in (None, "not json", "123"):
+            self.assertEqual(loop_agent.queued_payload_text(bad), "")
+
+    def test_queue_database_path_prefers_newest_and_handles_none(self):
+        self.assertIsNone(loop_agent.queue_database_path())
+        older = self.home / "queue_1.sqlite"
+        newer = self.home / "queue_2.sqlite"
+        older.write_text("")
+        newer.write_text("")
+        os.utime(older, (1000, 1000))
+        os.utime(newer, (2000, 2000))
+        self.assertEqual(loop_agent.queue_database_path(), newer)
+
+    def test_prune_queued_item_ids_keeps_only_still_pending(self):
+        tracked = {"still-there", "consumed"}
+        with mock.patch.object(
+            loop_agent,
+            "queued_item_ids_for_thread",
+            return_value={"still-there"},
+        ):
+            self.assertEqual(
+                loop_agent.prune_queued_item_ids(SID, tracked), {"still-there"}
+            )
+        # An unreadable queue keeps the tracked set so nothing is forgotten.
+        with mock.patch.object(
+            loop_agent, "queued_item_ids_for_thread", return_value=None
+        ):
+            self.assertEqual(loop_agent.prune_queued_item_ids(SID, tracked), tracked)
+
+    def test_queue_wait_outcome_treats_own_prompt_as_observed(self):
+        baseline = loop_agent.iso_to_epoch("2026-09-13T00:00:10.000Z")
+        events = [
+            {
+                "type": "event_msg",
+                "timestamp": "2026-09-13T00:00:20.000Z",
+                "payload": {"type": "user_message", "message": "继续"},
+            }
+        ]
+        self.assertEqual(
+            loop_agent.queue_wait_outcome(events, "继续", set(), baseline),
+            "observed",
+        )
+        # Our own prompt is never mistaken for an interrupting human.
+        self.assertNotEqual(
+            loop_agent.queue_wait_outcome(
+                events, "继续", {loop_agent.sha256_text("继续")}, baseline
+            ),
+            "user_pending",
+        )
+
+    def test_queue_wait_outcome_reports_real_user_message(self):
+        baseline = loop_agent.iso_to_epoch("2026-09-13T00:00:10.000Z")
+        events = [
+            {
+                "type": "event_msg",
+                "timestamp": "2026-09-13T00:00:20.000Z",
+                "payload": {"type": "user_message", "message": "插一句"},
+            }
+        ]
+        self.assertEqual(
+            loop_agent.queue_wait_outcome(events, "继续", set(), baseline),
+            "user_pending",
+        )
+
 
 def set_codex_home(value):
     if value is None:
