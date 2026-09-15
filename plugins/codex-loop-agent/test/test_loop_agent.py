@@ -177,6 +177,45 @@ class LoopAgentTests(unittest.TestCase):
             ["queued continuation", "classic user message"],
         )
 
+    def test_user_messages_are_sorted_by_timestamp(self):
+        """messages[-1] must be the newest message, whatever the file order."""
+        events = [
+            {
+                "type": "event_msg",
+                "timestamp": "2026-09-13T00:00:30.000Z",
+                "payload": {"type": "user_message", "message": "late"},
+            },
+            {
+                "type": "event_msg",
+                "timestamp": "2026-09-13T00:00:10.000Z",
+                "payload": {"type": "user_message", "message": "early"},
+            },
+        ]
+        messages = loop_agent.event_user_messages(events)
+        self.assertEqual([m["text"] for m in messages], ["early", "late"])
+
+    def test_user_message_without_timestamp_stays_visible(self):
+        """A timestamp-less user message must not become invisible.
+
+        Leaving its ts at 0 made it fail the armed_at filter, so neither
+        user-priority nor /stop detection could ever see it.
+        """
+        events = [
+            {
+                "type": "event_msg",
+                "timestamp": "2026-09-13T00:00:05.000Z",
+                "payload": {"type": "user_message", "message": "first"},
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "/stop"},
+            },
+        ]
+        messages = loop_agent.event_user_messages(events)
+        self.assertEqual([m["text"] for m in messages], ["first", "/stop"])
+        for message in messages:
+            self.assertGreater(message["ts"], 0.0)
+
     def test_current_object_payload_event_schema(self):
         path = self.sessions_root / "2026" / "09" / "13" / "rollout-object.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -215,6 +254,19 @@ class LoopAgentTests(unittest.TestCase):
         self.assertEqual([m["text"] for m in users], ["object user"])
         self.assertGreater(loop_agent.last_completion_ts(loaded), 0)
         self.assertEqual(loop_agent.last_assistant_text(loaded), "object answer")
+
+    def test_naive_timestamps_are_parsed_as_utc(self):
+        """Naive and Z-suffixed transcript timestamps must agree.
+
+        Naive values used to be parsed as local time, shifting them by the
+        machine's UTC offset and breaking armed_at and ownership windows.
+        """
+        naive = loop_agent.iso_to_epoch("2026-09-13T00:00:00.000")
+        zulu = loop_agent.iso_to_epoch("2026-09-13T00:00:00.000Z")
+        offset = loop_agent.iso_to_epoch("2026-09-13T08:00:00.000+08:00")
+        self.assertGreater(naive, 0.0)
+        self.assertEqual(naive, zulu)
+        self.assertEqual(naive, offset)
 
     def test_terminal_event_timestamps_separate_abort_from_complete(self):
         events = [
@@ -1332,6 +1384,39 @@ class LoopAgentTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(injected), 1)
 
+    def test_empty_rendered_continuation_falls_back_to_default(self):
+        """A template that renders empty must not inject an empty message."""
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "transport": "queue",
+                "cwd": str(self.home.resolve()),
+                # Only {{lastAnswer}}, and the transcript has no assistant
+                # text for this round, so this renders to "".
+                "continuation": "{{task}}",
+                "poll_ms": 1,
+                "quiet": True,
+            }
+        )
+        loop_agent.save_state(SID, state)
+        injected = []
+
+        def fake_queue(session_id, prompt):
+            injected.append(prompt)
+            state["stop_requested"] = True
+            loop_agent.save_state(SID, state)
+            return "Queued message aaaaaaaa-1111-1111-1111-111111111111 for thread x."
+
+        # Force the renderer to return an empty string.
+        with mock.patch.object(
+            loop_agent, "render_continuation", return_value=""
+        ), mock.patch.object(
+            loop_agent, "inject_via_queue", side_effect=fake_queue
+        ):
+            loop_agent.run_loop(SID, session, state)
+        self.assertEqual(injected, [loop_agent.DEFAULT_CONTINUATION])
+
     def test_build_codex_command_uses_resume_compatible_flags(self):
         command = loop_agent.build_codex_command(SID, "继续任务")
         self.assertEqual(
@@ -1387,6 +1472,122 @@ class LoopAgentTests(unittest.TestCase):
             rc = loop_agent.run_loop(SID, session, state)
         self.assertEqual(rc, 0)
         self.assertEqual(injected, [])
+
+    def test_user_message_identical_to_continuation_is_not_swallowed(self):
+        """A real user message must win even when its text equals the continuation.
+
+        Ownership used to be decided by text hash alone. If the user typed the
+        exact same text as the continuation while a turn was still running, the
+        driver classified it as its own message, saw no pending human, and
+        queued an extra continuation on top of the user's turn.
+        """
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        continuation = "继续"
+        with session.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-09-13T00:10:00.000Z",
+                        "payload": {"type": "user_message", "message": continuation},
+                    }
+                )
+                + "\n"
+            )
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "transport": "queue",
+                "cwd": str(self.home.resolve()),
+                "continuation": continuation,
+                "poll_ms": 1,
+                "quiet": True,
+                "armed_at": loop_agent.iso_to_epoch("2026-09-13T00:00:00.000Z"),
+                "sent_hashes": [loop_agent.sha256_text(continuation)],
+                # The only time we ever injected this text is long before the
+                # user's message, so the later message cannot be ours.
+                "sent_timestamps": [
+                    {
+                        "sha": loop_agent.sha256_text(continuation),
+                        "started_at": loop_agent.iso_to_epoch(
+                            "2026-09-13T00:00:05.000Z"
+                        ),
+                        "ended_at": loop_agent.iso_to_epoch(
+                            "2026-09-13T00:00:06.000Z"
+                        ),
+                    }
+                ],
+            }
+        )
+        loop_agent.save_state(SID, state)
+        injected = []
+
+        def fake_queue(session_id, prompt):
+            injected.append(prompt)
+            return "Queued message 88888888-8888-8888-8888-888888888888 for thread x."
+
+        ticks = {"n": 0}
+
+        def stop_after_ticks(seconds):
+            ticks["n"] += 1
+            if ticks["n"] >= 6:
+                state["stop_requested"] = True
+                loop_agent.save_state(SID, state)
+
+        with mock.patch.object(
+            loop_agent, "inject_via_queue", side_effect=fake_queue
+        ), mock.patch.object(
+            loop_agent.time, "sleep", side_effect=stop_after_ticks
+        ):
+            rc = loop_agent.run_loop(SID, session, state)
+        self.assertEqual(rc, 0)
+        self.assertEqual(injected, [])
+
+    def test_queued_stop_command_is_detected(self):
+        """A queued /stop must stop the loop without reaching the transcript."""
+        items = [("item-user", "/stop"), ("item-other", "普通消息")]
+        with mock.patch.object(
+            loop_agent, "queued_items_for_thread", return_value=items
+        ):
+            self.assertEqual(loop_agent.queued_stop_item(SID), ("item-user", "/stop"))
+            # Our own tracked items are never mistaken for a user stop.
+            self.assertIsNone(
+                loop_agent.queued_stop_item(SID, own_item_ids={"item-user"})
+            )
+
+    def test_run_loop_stops_on_queued_stop_command(self):
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "transport": "queue",
+                "cwd": str(self.home.resolve()),
+                "continuation": "继续",
+                "poll_ms": 1,
+                "quiet": True,
+            }
+        )
+        loop_agent.save_state(SID, state)
+        injected = []
+        cancelled = []
+
+        def fake_queue(session_id, prompt):
+            injected.append(prompt)
+            return "Queued message 99999999-9999-9999-9999-999999999999 for thread x."
+
+        with mock.patch.object(
+            loop_agent, "inject_via_queue", side_effect=fake_queue
+        ), mock.patch.object(
+            loop_agent,
+            "queued_stop_item",
+            return_value=("item-stop", "/stop"),
+        ), mock.patch.object(
+            loop_agent, "cancel_queued_item", side_effect=lambda *a: cancelled.append(a) or True
+        ):
+            rc = loop_agent.run_loop(SID, session, state)
+        self.assertEqual(rc, 0)
+        self.assertEqual(injected, [])
+        self.assertTrue(cancelled)
 
     def test_cancel_queued_item_removes_our_pending_row(self):
         queue_db = self.home / "queue_1.sqlite"
@@ -1689,6 +1890,49 @@ class LoopAgentTests(unittest.TestCase):
                 events, "继续", {loop_agent.sha256_text("继续")}, baseline
             ),
             "user_pending",
+        )
+
+    def test_queue_wait_outcome_treats_earlier_same_text_as_user(self):
+        """A same-text message older than our injection is the user's.
+
+        Regression test: text-hash-only ownership classified the user's
+        message as our own continuation and closed the round early.
+        """
+        baseline = loop_agent.iso_to_epoch("2026-09-13T00:00:10.000Z")
+        injection_started = loop_agent.iso_to_epoch("2026-09-13T00:00:30.000Z")
+        events = [
+            {
+                "type": "event_msg",
+                "timestamp": "2026-09-13T00:00:20.000Z",
+                "payload": {"type": "user_message", "message": "继续"},
+            }
+        ]
+        self.assertEqual(
+            loop_agent.queue_wait_outcome(
+                events,
+                "继续",
+                {loop_agent.sha256_text("继续")},
+                baseline,
+                injection_started,
+            ),
+            "user_pending",
+        )
+        # A copy landing inside our injection window is ours.
+        self.assertEqual(
+            loop_agent.queue_wait_outcome(
+                [
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-09-13T00:00:35.000Z",
+                        "payload": {"type": "user_message", "message": "继续"},
+                    }
+                ],
+                "继续",
+                {loop_agent.sha256_text("继续")},
+                baseline,
+                injection_started,
+            ),
+            "observed",
         )
 
     def test_queue_wait_outcome_reports_real_user_message(self):

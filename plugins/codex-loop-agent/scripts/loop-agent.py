@@ -34,6 +34,10 @@ DEFAULT_CONTINUATION = "继续，并深度检查暗病，遇到暗病和缺陷�
 CONFIG_FILE = ".codex-loop-agent.json"
 RUNTIME_DIR = ".codex-loop-agent"
 SESSIONS_DIR = "sessions"
+# Transcript timestamps and local wall-clock time are written by
+# different components; allow a small skew when deciding whether a
+# message falls inside one of our injection windows.
+OWNERSHIP_SKEW_SECONDS = 2.0
 UUID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
     re.IGNORECASE,
@@ -153,6 +157,7 @@ def load_state(session_id: str) -> dict[str, Any]:
         "updated_at": None,
         "stop_requested": False,
         "continuation": None,
+        "continuation_explicit": False,
         "max_rounds": 0,
         "until": None,
         "initial_backoff_ms": 1000,
@@ -164,6 +169,10 @@ def load_state(session_id: str) -> dict[str, Any]:
         "transport": "queue",
         "quiet": False,
         "sent_hashes": [],
+        # Each injection window: {"sha", "started_at", "ended_at"}.
+        # Ownership must never be decided by text alone, because a
+        # user can type the same text as the continuation.
+        "sent_timestamps": [],
         "last_completion_ts": 0.0,
         **payload,
     }
@@ -284,6 +293,11 @@ def iso_to_epoch(value: Any) -> float:
             return float(text)
         try:
             parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                # Transcript timestamps are UTC. Interpreting a naive value
+                # as local time shifts it by the machine's UTC offset, which
+                # is large enough to break armed_at and ownership windows.
+                parsed = parsed.replace(tzinfo=dt.timezone.utc)
             return parsed.timestamp()
         except ValueError:
             return 0.0
@@ -459,9 +473,19 @@ def event_user_messages(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         timestamp = iso_to_epoch(event.get("timestamp")) or iso_to_epoch(
             payload.get("timestamp")
         )
+        if timestamp <= 0.0:
+            # Some writers omit the timestamp. Leaving ts at 0 would make the
+            # message invisible to both user-priority and stop detection, so
+            # inherit the newest timestamp seen so far to keep ordering
+            # intact without inventing a future time.
+            timestamp = messages[-1]["ts"] if messages else 0.0
         messages.append(
             {"ts": timestamp, "text": stripped, "sha": sha256_text(stripped)}
         )
+    # Order by timestamp, not file position. Replayed, appended, or clock-
+    # skewed events can be out of order, and callers rely on messages[-1]
+    # being the newest message. Ties keep file order for stability.
+    messages.sort(key=lambda message: message["ts"])
     return messages
 
 
@@ -556,13 +580,46 @@ def is_stop_message(text: str) -> bool:
     return any(re.search(pattern, lowered) for pattern in STOP_PATTERNS)
 
 
+def message_belongs_to_loop(
+    message: dict[str, Any],
+    sent_windows: list[dict[str, Any]],
+) -> bool:
+    """Decide whether a transcript user message is one we injected.
+
+    A text hash alone is not ownership: the user may type the same text.
+    A message only counts as ours when its timestamp falls inside a window
+    during which we actually injected that exact text.
+    """
+    sha = message.get("sha")
+    ts = float(message.get("ts") or 0.0)
+    for window in sent_windows:
+        if window.get("sha") != sha:
+            continue
+        started = float(window.get("started_at") or 0.0)
+        ended = float(window.get("ended_at") or 0.0)
+        if started <= 0.0:
+            continue
+        if started - OWNERSHIP_SKEW_SECONDS <= ts <= ended + OWNERSHIP_SKEW_SECONDS:
+            return True
+    return False
+
+
 def pending_human_message(
     messages: list[dict[str, Any]],
     sent_hashes: set[str],
     last_completion: float,
+    sent_windows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    humans = [m for m in messages if m["sha"] not in sent_hashes]
-    loops = [m for m in messages if m["sha"] in sent_hashes]
+    windows = sent_windows or []
+    humans: list[dict[str, Any]] = []
+    loops: list[dict[str, Any]] = []
+    for message in messages:
+        if message["sha"] not in sent_hashes or not message_belongs_to_loop(
+            message, windows
+        ):
+            humans.append(message)
+        else:
+            loops.append(message)
     if not humans:
         return None
     latest = humans[-1]
@@ -677,6 +734,28 @@ def queued_user_message_count(
             continue
         count += 1
     return count
+
+
+def queued_stop_item(
+    session_id: str, own_item_ids: set[str] | None = None
+) -> tuple[str, str] | None:
+    """Return a queued (id, text) that is a real user stop command.
+
+    A user may type /stop into a session that is busy; the desktop stores it
+    as a pending queue item. The loop must honor that intent even before the
+    message reaches the transcript, otherwise it keeps injecting work on top
+    of a stop request.
+    """
+    items = queued_items_for_thread(session_id)
+    if not items:
+        return None
+    tracked = own_item_ids or set()
+    for item_id, text in items:
+        if item_id in tracked:
+            continue
+        if is_stop_message(text):
+            return item_id, text
+    return None
 
 
 def queued_items_for_thread(session_id: str) -> list[tuple[str, str]] | None:
@@ -794,16 +873,31 @@ def reconcile_tracked_queue_items(session_id: str) -> set[str]:
     return set()
 
 
+def latest_transcript_ts(events: list[dict[str, Any]]) -> float:
+    latest = 0.0
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        ts = iso_to_epoch(event.get("timestamp"))
+        if ts > latest:
+            latest = ts
+    return latest
+
+
 def queue_wait_outcome(
     events: list[dict[str, Any]],
     prompt: str,
     sent_hashes: set[str],
     baseline_ts: float,
+    injection_started_at: float = 0.0,
 ) -> str:
     """Classify what the session history shows while a prompt is queued.
 
     ``observed`` means this prompt has appeared in the transcript. A prompt
-    from before the injection baseline never counts.
+    from before the injection baseline never counts. Matching text alone is
+    not enough to claim a message as ours: when the user types the same
+    text, the message must be classified as ``user_pending`` so their turn
+    keeps priority.
     """
     messages = event_user_messages(events)
     own_sha = sha256_text(prompt)
@@ -813,8 +907,16 @@ def queue_wait_outcome(
     # therefore treat the older copy as this round's, closing the round
     # instantly and firing another identical continuation.
     for message in messages:
-        if message["sha"] == own_sha and message["ts"] > baseline_ts:
-            return "observed"
+        if message["sha"] != own_sha or message["ts"] <= baseline_ts:
+            continue
+        # A same-text message older than this injection cannot be the copy
+        # we just queued; the user must have typed it.
+        if (
+            injection_started_at
+            and message["ts"] < injection_started_at - OWNERSHIP_SKEW_SECONDS
+        ):
+            return "user_pending"
+        return "observed"
     for message in messages:
         if message["sha"] in sent_hashes:
             continue
@@ -828,9 +930,24 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
     _CURRENT_SESSION = session_id
 
     cwd = Path(state.get("cwd") or os.getcwd()).expanduser().resolve()
-    continuation = state.get("continuation") or load_global_config().get(
-        "continuation", DEFAULT_CONTINUATION
-    )
+
+    def current_continuation() -> str:
+        """Resolve the continuation for the next round.
+
+        A value recorded in this session's state is an explicit choice for
+        this loop, so it wins. When the state has none (an older state file,
+        or a bare activation), fall back to the live global setting so
+        config-page edits still take effect.
+        """
+        recorded = str(state.get("continuation") or "").strip()
+        if recorded:
+            return recorded
+        live = load_global_config().get("continuation")
+        if isinstance(live, str) and live.strip():
+            return live
+        return DEFAULT_CONTINUATION
+
+    continuation = current_continuation()
     max_rounds = int(state.get("max_rounds") or 0)
     until = parse_until(state.get("until"))
     initial_backoff = float(state.get("initial_backoff_ms") or 1000) / 1000.0
@@ -854,6 +971,9 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
     save_state(session_id, state)
 
     sent_hashes = set(state.get("sent_hashes") or [])
+    sent_windows: list[dict[str, Any]] = [
+        window for window in (state.get("sent_timestamps") or []) if window
+    ]
     queued_item_ids: set[str] = set(state.get("queued_item_ids") or [])
     rounds = int(state.get("rounds") or 0)
     last_completion = float(state.get("last_completion_ts") or 0.0)
@@ -865,6 +985,7 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
     def persist_progress(status: str = "running") -> None:
         state["status"] = status
         state["sent_hashes"] = sorted(sent_hashes)
+        state["sent_timestamps"] = sent_windows
         state["queued_item_ids"] = sorted(queued_item_ids)
         state["rounds"] = rounds
         state["last_completion_ts"] = last_completion
@@ -946,8 +1067,15 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
         messages = event_user_messages(events)
 
         relevant = [m for m in messages if m["ts"] >= armed_at]
-        humans = [m for m in relevant if m["sha"] not in sent_hashes]
-        loops = [m for m in relevant if m["sha"] in sent_hashes]
+        humans: list[dict[str, Any]] = []
+        loops: list[dict[str, Any]] = []
+        for message in relevant:
+            if message["sha"] not in sent_hashes or not message_belongs_to_loop(
+                message, sent_windows
+            ):
+                humans.append(message)
+            else:
+                loops.append(message)
         latest_loop_ts = loops[-1]["ts"] if loops else 0.0
         for human in humans:
             if human["ts"] > latest_loop_ts and is_stop_message(human["text"]):
@@ -966,11 +1094,17 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
 
         last_answer = last_assistant_text(events)
         task = original_task_text(messages)
+        continuation = current_continuation()
         prompt = (
             failed_prompt
             if failed_prompt is not None
             else render_continuation(continuation, last_answer, rounds + 1, task)
         )
+        if not prompt.strip():
+            # A template like "{{lastAnswer}}" can render empty. Injecting an
+            # empty user message would either fail or spin without progress,
+            # so fall back to the default continuation.
+            prompt = DEFAULT_CONTINUATION
 
         transport = str(state.get("transport") or "queue")
         if transport == "queue":
@@ -996,6 +1130,18 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
             # Our own continuation may still be sitting in the queue while
             # the desktop has not picked it up yet. It is not a human
             # message, so exclude every id we already track.
+            stop_item = queued_stop_item(session_id, queued_item_ids)
+            if stop_item:
+                stop_id, stop_text = stop_item
+                log_line(
+                    session_id,
+                    f"queued user stop command detected: {stop_text!r}",
+                    quiet,
+                )
+                # Drop the stop item so it does not linger as a ghost
+                # message; stop_loop withdraws any of our own pending work.
+                cancel_queued_item(session_id, stop_id)
+                return stop_loop("user queued a stop command")
             pending_user = queued_user_message_count(
                 session_id, own_item_ids=queued_item_ids
             )
@@ -1009,6 +1155,10 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
                 time.sleep(poll_seconds)
                 continue
             queued_at = max((m["ts"] for m in messages), default=0.0)
+            # Anchor ownership windows on the transcript's own clock. Mixing
+            # transcript timestamps with local wall-clock time breaks as soon
+            # as they disagree, and the tests reuse fixed historical dates.
+            injection_started_at = queued_at
             log_line(session_id, f"round {rounds + 1}: queueing continuation", quiet)
             state["last_attempt_at"] = now_iso()
             persist_progress()
@@ -1050,7 +1200,11 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
                     return stop_loop("session was archived or deleted")
 
                 outcome = queue_wait_outcome(
-                    read_events(session_file), prompt, sent_hashes, queued_at
+                    read_events(session_file),
+                    prompt,
+                    sent_hashes,
+                    queued_at,
+                    injection_started_at,
                 )
                 if outcome == "observed":
                     observed = True
@@ -1067,6 +1221,19 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
                     withdraw_pending_queued_items()
                     persist_progress()
                     break
+
+                stop_item = queued_stop_item(
+                    session_id, queued_item_ids
+                )
+                if stop_item:
+                    stop_id, stop_text = stop_item
+                    log_line(
+                        session_id,
+                        f"queued user stop command detected: {stop_text!r}",
+                        quiet,
+                    )
+                    cancel_queued_item(session_id, stop_id)
+                    return stop_loop("user queued a stop command")
 
                 waiting = queued_user_message_count(
                     session_id, own_prompt_sha=sha256_text(prompt)
@@ -1145,7 +1312,18 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
             if observed:
                 queued_item_ids = prune_queued_item_ids(session_id, queued_item_ids)
                 rounds += 1
-                sent_hashes.add(sha256_text(prompt))
+                prompt_sha = sha256_text(prompt)
+                sent_hashes.add(prompt_sha)
+                sent_windows.append(
+                    {
+                        "sha": prompt_sha,
+                        "started_at": injection_started_at,
+                        "ended_at": max(
+                            latest_transcript_ts(read_events(session_file)),
+                            injection_started_at,
+                        ),
+                    }
+                )
                 last_completion = max(last_completion, time.time())
                 backoff = initial_backoff
                 failed_prompt = None
@@ -1164,6 +1342,9 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
             continue
 
         log_line(session_id, f"round {rounds + 1}: resuming session", quiet)
+        # Same transcript-anchored clock as the queue path, so ownership
+        # windows stay comparable to event timestamps.
+        attempt_started_at = max((m["ts"] for m in messages), default=0.0)
         state["last_attempt_at"] = now_iso()
         persist_progress()
         process: subprocess.Popen | None = None
@@ -1228,7 +1409,18 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
 
         if result.returncode == 0:
             rounds += 1
-            sent_hashes.add(sha256_text(prompt))
+            prompt_sha = sha256_text(prompt)
+            sent_hashes.add(prompt_sha)
+            sent_windows.append(
+                {
+                    "sha": prompt_sha,
+                    "started_at": attempt_started_at,
+                    "ended_at": max(
+                        latest_transcript_ts(read_events(session_file)),
+                        attempt_started_at,
+                    ),
+                }
+            )
             last_completion = max(last_completion, time.time())
             backoff = initial_backoff
             failed_prompt = None
@@ -1359,6 +1551,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             "stop_requested": False,
             "continuation": args.continuation
             or load_global_config().get("continuation", DEFAULT_CONTINUATION),
+            "continuation_explicit": bool(args.continuation),
             "max_rounds": int(args.max_rounds or 0),
             "until": args.until,
             "initial_backoff_ms": float(args.initial_backoff_ms),
@@ -1609,7 +1802,7 @@ def cmd_logs(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="codex-loop-agent", description=__doc__)
-    parser.add_argument("--version", action="version", version="codex-loop-agent 1.0.20260918")
+    parser.add_argument("--version", action="version", version="codex-loop-agent 1.0.20260919")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     start = subparsers.add_parser("start", help="start an endless loop for a Codex session")
