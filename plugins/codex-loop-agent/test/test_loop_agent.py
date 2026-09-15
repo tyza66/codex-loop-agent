@@ -1648,6 +1648,116 @@ class LoopAgentTests(unittest.TestCase):
                 1,
             )
 
+    def test_own_continuation_mentioning_stop_is_not_a_stop(self):
+        """A continuation that *mentions* /stop must not kill the loop.
+
+        Users naturally phrase continuations as instructions that name the
+        stop command ("keep going until the user types /stop"). If that text
+        is treated as a stop request, activating the loop stops it instantly.
+        """
+        continuation = "继续工作，直到用户输入 /stop 为止"
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "transport": "queue",
+                "cwd": str(self.home.resolve()),
+                "continuation": continuation,
+                "poll_ms": 1,
+                "quiet": True,
+            }
+        )
+        loop_agent.save_state(SID, state)
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        injected = []
+
+        def fake_queue(session_id, prompt):
+            injected.append(prompt)
+            state["stop_requested"] = True
+            loop_agent.save_state(SID, state)
+            return "Queued message 12121212-1212-1212-1212-121212121212 for thread x."
+
+        with mock.patch.object(
+            loop_agent, "inject_via_queue", side_effect=fake_queue
+        ):
+            rc = loop_agent.run_loop(SID, session, state)
+        self.assertEqual(rc, 0)
+        self.assertEqual(injected, [continuation])
+
+    def test_conversational_stop_request_only_stops_on_clear_intent(self):
+        """Work instructions that merely contain a stop word must not stop.
+
+        "别继续做重构，改修这个 bug" is a redirect, not a request to turn
+        the endless loop off; killing the loop there silently loses work.
+        """
+        redirect = "先别继续做重构，改修这个 bug"
+        self.assertFalse(loop_agent.is_stop_message(redirect))
+        self.assertTrue(loop_agent.is_stop_message("停止无尽模式"))
+        self.assertTrue(loop_agent.is_stop_message("/stop"))
+        self.assertTrue(loop_agent.is_stop_message("stop the endless loop"))
+
+        # A trailing instruction means "redirect", not "turn the loop off".
+        for text in (
+            "先别继续做重构，改修这个 bug",
+            "停一下，先看看日志",
+            "别继续跑测试了，先解释一下",
+            "继续，直到用户输入 /stop 为止",
+            "请不要停止，继续修",
+        ):
+            self.assertFalse(loop_agent.is_stop_message(text), text)
+        # Clear stop intents still match, including short bare forms.
+        for text in (
+            "停止无尽模式",
+            "/stop",
+            "stop the endless loop",
+            "stop",
+            "Stop it.",
+            "停一下",
+        ):
+            self.assertTrue(loop_agent.is_stop_message(text), text)
+
+    def test_resolve_session_survives_files_vanishing_mid_scan(self):
+        """A session file removed between scan and stat must not crash us.
+
+        Rollouts are rotated and archived while the driver runs, so a
+        vanished file is an expected race, not a fatal error.
+        """
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        ghost = session.parent / "rollout-vanished.jsonl"
+        os.symlink("/nonexistent-rollout-target", ghost)
+        sid, path = loop_agent.resolve_session(None, str(self.home.resolve()), False)
+        self.assertEqual(sid, SID)
+        self.assertEqual(path, session)
+    def test_event_user_messages_deduplicates_same_turn(self):
+        """One user turn must produce one message, not two.
+
+        The desktop writes both an event_msg and a response_item for the
+        same user turn. Without dedup the driver sees two messages with
+        slightly different timestamps, which can split across a sent-window
+        boundary and stall the loop on a turn that is already complete.
+        """
+        events = [
+            {
+                "type": "event_msg",
+                "timestamp": "2026-09-13T00:00:03.000Z",
+                "payload": {"type": "user_message", "message": "hello"},
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-09-13T00:00:03.100Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+            },
+        ]
+        self.assertEqual(loop_agent.event_user_messages(events), [{
+            "ts": loop_agent.iso_to_epoch("2026-09-13T00:00:03.000Z"),
+            "text": "hello",
+            "sha": loop_agent.sha256_text("hello"),
+        }])
+
+
     def test_run_loop_does_not_stall_on_its_own_queued_continuation(self):
         session = session_file(self.sessions_root, SID, str(self.home.resolve()))
         own_id = "77777777-7777-7777-7777-777777777777"
@@ -1783,6 +1893,14 @@ class LoopAgentTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             loop_agent.parse_until("not-a-time")
+
+    def test_parse_until_rejects_epoch_zero_but_accepts_real_times(self):
+        with self.assertRaises(ValueError):
+            loop_agent.parse_until("0")
+        self.assertEqual(
+            loop_agent.parse_until("2026-09-13T00:00:00.000Z"),
+            1789257600.0,
+        )
 
     def test_queued_payload_text_collects_real_user_input(self):
         payload = json.dumps(

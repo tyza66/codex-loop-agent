@@ -42,19 +42,32 @@ UUID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
     re.IGNORECASE,
 )
-STOP_PATTERNS = [
-    r"/stop\b",
-    r"/forever\s+stop\b",
-    r"stop\s+(the\s+)?loop\b",
-    r"停止无尽模式",
-    r"停止无限循环",
-    r"退出无尽模式",
-    r"关闭无尽模式",
-    r"停止循环",
-    r"停一下",
-    r"不要再继续",
-    r"不要再跑",
-    r"别继续",
+# A stop request must be an explicit command to end the loop, not a work
+# instruction that merely contains a stop-shaped word. Matching the bare
+# "别继续" substring would silently kill the loop on "先别继续做重构，改修
+# 这个 bug", dropping the user's real request. Every entry is
+# (pattern, whole_message_only); the flag is true for phrases that can
+# appear inside a legitimate instruction. See `is_stop_message`.
+STOP_PATTERNS: list[tuple[str, bool]] = [
+    # A message that merely *mentions* a stop phrase is not a stop
+    # request: "继续，直到用户输入 /stop 为止" is a continuation some
+    # users write, and a trailing instruction like "停一下，先看看日志"
+    # is a redirect. These phrases therefore only count when the message
+    # is essentially *just* the phrase. Exact-command handling lives in
+    # `is_stop_message`, which also allows a short trailing particle.
+    (r"/stop\b", True),
+    (r"/forever\s+stop\b", True),
+    (r"停止无尽模式", True),
+    (r"停止无限循环", True),
+    (r"退出无尽模式", True),
+    (r"关闭无尽模式", True),
+    (r"停止循环", True),
+    (r"不要再继续", True),
+    (r"不要再跑", True),
+    (r"stop(\s+the)?(\s+endless)?(\s+loop)\b", True),
+    (r"停一下", True),
+    (r"别继续", True),
+    (r"stop(\s+it)?\b", True),
 ]
 CONTEXT_ERROR_MARKERS = (
     "context",
@@ -397,11 +410,21 @@ def resolve_session(
     if not sessions_root.is_dir():
         raise RuntimeError(f"no Codex sessions directory at {sessions_root}")
 
+    def sort_key(path: Path) -> float:
+        # Rollouts are archived and rotated while we scan, so a file can
+        # vanish between rglob() and stat(). A missing file is an expected
+        # race, not a fatal error; sort it last instead of raising.
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return float("-inf")
+
     files = sorted(
         sessions_root.rglob("*.jsonl"),
-        key=lambda p: p.stat().st_mtime,
+        key=sort_key,
         reverse=True,
     )
+    files = [path for path in files if path.exists()]
     if not files:
         raise RuntimeError(f"no Codex session files found under {sessions_root}")
 
@@ -460,6 +483,33 @@ def _user_message_text(event: dict[str, Any], payload: dict[str, Any]) -> str | 
     return None
 
 
+def _dedupe_same_turn(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse the two records the desktop writes for one user turn.
+
+    A single user turn is recorded as both an ``event_msg`` (user_message)
+    and a ``response_item`` (message, role=user) with the same text and a
+    slightly different timestamp. Without collapsing, the driver sees two
+    messages per turn; if a sent-window boundary lands between the two
+    timestamps they get split between the "loop" and "human" buckets,
+    which can stall the loop on a turn that is already complete.
+    """
+    if not messages:
+        return messages
+    deduped: list[dict[str, Any]] = [messages[0]]
+    # The two records for one turn are within a few hundred milliseconds;
+    # real separate user turns are seconds apart. 1s is wide enough to
+    # absorb clock skew but narrow enough to never merge two real turns.
+    merge_window = 1.0
+    for message in messages[1:]:
+        prev = deduped[-1]
+        if message["sha"] == prev["sha"] and message["ts"] - prev["ts"] < merge_window:
+            # Keep the earlier timestamp; it is the authoritative one for
+            # ownership-window classification.
+            continue
+        deduped.append(message)
+    return deduped
+
+
 def event_user_messages(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     for event in events:
@@ -486,8 +536,7 @@ def event_user_messages(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     # skewed events can be out of order, and callers rely on messages[-1]
     # being the newest message. Ties keep file order for stability.
     messages.sort(key=lambda message: message["ts"])
-    return messages
-
+    return _dedupe_same_turn(messages)
 
 def last_completion_ts(events: list[dict[str, Any]]) -> float:
     latest = 0.0
@@ -576,8 +625,31 @@ def render_continuation(
 
 
 def is_stop_message(text: str) -> bool:
-    lowered = text.lower()
-    return any(re.search(pattern, lowered) for pattern in STOP_PATTERNS)
+    """True only when the message asks to end the endless loop.
+
+    Substring matching on stop-shaped words is dangerous: "先别继续做重构，
+    改修这个 bug" and "停一下，先看看日志" are work instructions that
+    happen to contain those words. Killing the loop there silently drops
+    the user's real request, so ambiguous bare phrases only count when
+    they are the entire message. Unambiguous loop phrases and explicit
+    commands still match anywhere.
+    """
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    for pattern, whole_message_only in STOP_PATTERNS:
+        match = re.search(pattern, lowered)
+        if not match:
+            continue
+        if not whole_message_only:
+            return True
+        # A bare "停一下" is a stop; "停一下，先看看日志" is a redirect
+        # with a trailing instruction. Only the former counts.
+        remainder = (lowered[: match.start()] + lowered[match.end() :]).strip()
+        remainder = remainder.strip("。！，,.! \t")
+        if not remainder:
+            return True
+    return False
 
 
 def message_belongs_to_loop(
