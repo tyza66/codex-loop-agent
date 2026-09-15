@@ -620,17 +620,66 @@ def queue_database_path() -> Path | None:
 
 
 def queued_user_message_count(
-    session_id: str, exclude_ids: set[str] | None = None
+    session_id: str,
+    own_prompt_sha: str | None = None,
 ) -> int | None:
-    """Count queue items still waiting for this thread's current turn.
+    """Count queued items that are not this prompt's own continuation."""
+    items = queued_items_for_thread(session_id)
+    if items is None:
+        return None
+    count = 0
+    for _item_id, text in items:
+        if own_prompt_sha and sha256_text(text) == own_prompt_sha:
+            continue
+        count += 1
+    return count
 
-    Returns None when the queue store cannot be read. The caller treats
-    that as unknown and falls back to session-history observation.
-    """
+
+def queued_items_for_thread(session_id: str) -> list[tuple[str, str]] | None:
+    """Return (id, user text) pairs currently queued for this thread."""
     path = queue_database_path()
     if path is None:
-        return 0
-    skip = set(exclude_ids or [])
+        return []
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            rows = connection.execute(
+                "SELECT id, payload_json FROM queued_items WHERE thread_id = ?",
+                (session_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError):
+        return None
+    return [(row[0], queued_payload_text(row[1])) for row in rows]
+
+
+def queued_payload_text(payload_json: str) -> str:
+    try:
+        payload = json.loads(payload_json)
+    except (TypeError, ValueError):
+        return ""
+    texts: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in ("text", "message") and isinstance(item, str):
+                    texts.append(item)
+                else:
+                    collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    collect(payload)
+    return "\n".join(texts)
+
+
+def queued_item_ids_for_thread(session_id: str) -> set[str] | None:
+    path = queue_database_path()
+    if path is None:
+        return set()
     try:
         connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
@@ -641,7 +690,16 @@ def queued_user_message_count(
             connection.close()
     except (sqlite3.Error, OSError):
         return None
-    return sum(1 for (item_id,) in rows if item_id not in skip)
+    return {item_id for (item_id,) in rows}
+
+
+def prune_queued_item_ids(
+    session_id: str, queued_item_ids: set[str]
+) -> set[str]:
+    remaining = queued_item_ids_for_thread(session_id)
+    if remaining is None:
+        return set(queued_item_ids)
+    return set(queued_item_ids) & remaining
 
 
 def queue_wait_outcome(
@@ -650,10 +708,16 @@ def queue_wait_outcome(
     sent_hashes: set[str],
     baseline_ts: float,
 ) -> str:
+    """Classify what the session history shows while a prompt is queued.
+
+    ``observed`` means this prompt has appeared in the transcript. A prompt
+    from before the injection baseline never counts.
+    """
     messages = event_user_messages(events)
-    seen = {message["sha"] for message in messages}
-    if sha256_text(prompt) in seen:
-        return "observed"
+    own_sha = sha256_text(prompt)
+    for message in messages:
+        if message["sha"] == own_sha and message["ts"] >= baseline_ts:
+            return "observed"
     for message in messages:
         if message["sha"] in sent_hashes:
             continue
@@ -773,7 +837,7 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
 
         transport = str(state.get("transport") or "queue")
         if transport == "queue":
-            queued_at = time.time()
+            queued_at = max((m["ts"] for m in messages), default=0.0)
             log_line(session_id, f"round {rounds + 1}: queueing continuation", quiet)
             state["last_attempt_at"] = now_iso()
             persist_progress()
@@ -795,42 +859,17 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
                 time.sleep(backoff)
                 backoff = min(max_backoff, backoff * backoff_factor)
                 continue
-            # The message is queued, not yet consumed. Wait until we observe it
-            # land in the session history before queueing the next one so the
-            # queue never piles up duplicate continuations.
-            deadline = time.time() + max(30.0, poll_seconds * 15)
+            # The message is queued, not yet consumed. Wait until we observe
+            # it in the transcript before queueing the next continuation, so
+            # the queue never piles up duplicates and a busy thread cannot
+            # trigger a re-injection storm.
             observed = False
-            while time.time() < deadline:
+            first_wait_logged = False
+            last_wait_log = 0.0
+            while True:
                 if not session_file.exists():
                     return stop_loop("session file was archived or deleted")
-                waiting = queued_user_message_count(session_id, queued_item_ids)
-                if queued_item_ids and waiting is not None and waiting == 0:
-                    outcome = queue_wait_outcome(
-                        read_events(session_file), prompt, sent_hashes, queued_at
-                    )
-                    if outcome == "observed":
-                        observed = True
-                        break
-                if waiting:
-                    current_state = load_state(session_id)
-                if waiting:
-                    if current_state.get("stop_requested"):
-                        return stop_loop("stop requested via state file")
-                    if load_global_config().get("disabled"):
-                        persist_progress("disabled")
-                        log_line(
-                            session_id,
-                            "global endless-loop switch is off; use `config enable` to turn it back on",
-                            quiet,
-                        )
-                        return 0
-                    log_line(
-                        session_id,
-                        f"{waiting} user message(s) still queued ahead of the continuation",
-                        quiet,
-                    )
-                    time.sleep(max(0.2, poll_seconds / 2.0))
-                    continue
+
                 outcome = queue_wait_outcome(
                     read_events(session_file), prompt, sent_hashes, queued_at
                 )
@@ -845,6 +884,27 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
                     )
                     persist_progress()
                     break
+
+                waiting = queued_user_message_count(
+                    session_id, own_prompt_sha=sha256_text(prompt)
+                )
+                now = time.time()
+                if not first_wait_logged or now - last_wait_log >= 60.0:
+                    if waiting:
+                        log_line(
+                            session_id,
+                            f"{waiting} user message(s) queued ahead of the continuation",
+                            quiet,
+                        )
+                    else:
+                        log_line(
+                            session_id,
+                            "continuation accepted by the queue; waiting for it to be consumed",
+                            quiet,
+                        )
+                    first_wait_logged = True
+                    last_wait_log = now
+
                 current_state = load_state(session_id)
                 if current_state.get("stop_requested"):
                     return stop_loop("stop requested via state file")
@@ -858,6 +918,7 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
                     return 0
                 time.sleep(max(0.2, poll_seconds / 2.0))
             if observed:
+                queued_item_ids = prune_queued_item_ids(session_id, queued_item_ids)
                 rounds += 1
                 sent_hashes.add(sha256_text(prompt))
                 last_completion = max(last_completion, time.time())

@@ -942,7 +942,7 @@ class LoopAgentTests(unittest.TestCase):
                 )
             state["stop_requested"] = True
             loop_agent.save_state(SID, state)
-            return f"Queued {prompt}"
+            return "Queued message 55555555-5555-5555-5555-555555555555 for thread x."
 
         with mock.patch.object(
             loop_agent, "inject_via_queue", side_effect=fake_queue
@@ -1051,7 +1051,7 @@ class LoopAgentTests(unittest.TestCase):
             injected.append(prompt)
             return "Queued message 22222222-2222-2222-2222-222222222222 for thread x."
 
-        def fake_count(session_id, exclude_ids=None):
+        def fake_count(session_id, **kwargs):
             return next(waiting_counts, 0)
 
         def stop_on_sleep(seconds):
@@ -1066,6 +1066,55 @@ class LoopAgentTests(unittest.TestCase):
             rc = loop_agent.run_loop(SID, session, state)
         self.assertEqual(rc, 0)
         self.assertEqual(injected, ["继续"])
+
+    def test_queue_wait_does_not_reinject_same_prompt_when_queue_is_full(self):
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "transport": "queue",
+                "cwd": str(self.home.resolve()),
+                "continuation": "继续",
+                "poll_ms": 1,
+                "quiet": True,
+            }
+        )
+        loop_agent.save_state(SID, state)
+        injected = []
+        counts = iter([1, 1, 1, 1, 0, 0])
+
+        def fake_queue(session_id, prompt):
+            injected.append(prompt)
+            return "Queued message 33333333-3333-3333-3333-333333333333 for thread x."
+
+        def fake_count(session_id, **kwargs):
+            return next(counts, 0)
+
+        def stop_on_sleep(seconds):
+            state["stop_requested"] = True
+            loop_agent.save_state(SID, state)
+
+        with mock.patch.object(
+            loop_agent, "inject_via_queue", side_effect=fake_queue
+        ), mock.patch.object(
+            loop_agent, "queued_user_message_count", side_effect=fake_count
+        ), mock.patch.object(loop_agent.time, "sleep", side_effect=stop_on_sleep):
+            rc = loop_agent.run_loop(SID, session, state)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(injected), 1)
+
+    def test_queue_wait_ignores_matching_prompt_from_before_baseline(self):
+        baseline = loop_agent.iso_to_epoch("2026-09-13T00:00:10.000Z")
+        events = [
+            {
+                "type": "event_msg",
+                "timestamp": "2026-09-13T00:00:03.000Z",
+                "payload": {"type": "user_message", "message": "继续"},
+            }
+        ]
+        self.assertEqual(
+            loop_agent.queue_wait_outcome(events, "继续", set(), baseline), "waiting"
+        )
 
     def test_old_stop_message_before_arm_time_does_not_stop(self):
         session = session_file(self.sessions_root, SID, str(self.home.resolve()))
@@ -1098,7 +1147,7 @@ class LoopAgentTests(unittest.TestCase):
             injected.append(prompt)
             state["stop_requested"] = True
             loop_agent.save_state(SID, state)
-            return "queued"
+            return "Queued message 44444444-4444-4444-4444-444444444444 for thread x."
 
         with mock.patch.object(
             loop_agent, "inject_via_queue", side_effect=fake_queue
