@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -1248,6 +1249,102 @@ class LoopAgentTests(unittest.TestCase):
             rc = loop_agent.run_loop(SID, session, state)
         self.assertEqual(rc, 0)
         self.assertEqual(injected, [])
+
+    def test_cancel_queued_item_removes_our_pending_row(self):
+        queue_db = self.home / "queue_1.sqlite"
+        connection = sqlite3.connect(queue_db)
+        connection.execute(
+            "CREATE TABLE queued_items (id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL, payload_json TEXT NOT NULL, queue_order INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO queued_items VALUES (?, ?, ?, ?, ?, ?)",
+            ("item-1", SID, "{}", 1, 1, 1),
+        )
+        connection.execute(
+            "INSERT INTO queued_items VALUES (?, ?, ?, ?, ?, ?)",
+            ("item-other", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "{}", 1, 1, 1),
+        )
+        connection.commit()
+        connection.close()
+
+        self.assertTrue(loop_agent.cancel_queued_item(SID, "item-1"))
+        remaining = loop_agent.queued_item_ids_for_thread(SID)
+        self.assertEqual(remaining, set())
+        other = loop_agent.queued_item_ids_for_thread(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        )
+        self.assertEqual(other, {"item-other"})
+
+    def test_reconcile_withdraws_stale_tracked_items(self):
+        queue_db = self.home / "queue_1.sqlite"
+        connection = sqlite3.connect(queue_db)
+        connection.execute(
+            "CREATE TABLE queued_items (id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL, payload_json TEXT NOT NULL, queue_order INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO queued_items VALUES (?, ?, ?, ?, ?, ?)",
+            ("still-pending", SID, "{}", 1, 1, 1),
+        )
+        connection.commit()
+        connection.close()
+
+        state = loop_agent.load_state(SID)
+        state["queued_item_ids"] = ["still-pending", "already-gone"]
+        state["status"] = "stopped"
+        loop_agent.save_state(SID, state)
+
+        self.assertEqual(loop_agent.reconcile_tracked_queue_items(SID), set())
+        self.assertEqual(loop_agent.queued_item_ids_for_thread(SID), set())
+        reloaded = loop_agent.load_state(SID)
+        self.assertEqual(reloaded.get("queued_item_ids") or [], [])
+
+    def test_stop_withdraws_pending_queued_continuation(self):
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        queue_db = self.home / "queue_1.sqlite"
+        connection = sqlite3.connect(queue_db)
+        connection.execute(
+            "CREATE TABLE queued_items (id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL, payload_json TEXT NOT NULL, queue_order INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)"
+        )
+        connection.commit()
+        connection.close()
+
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "transport": "queue",
+                "cwd": str(self.home.resolve()),
+                "continuation": "继续",
+                "poll_ms": 1,
+                "quiet": True,
+            }
+        )
+        loop_agent.save_state(SID, state)
+        injected = []
+        item_id = "99999999-9999-9999-9999-999999999999"
+
+        def fake_queue(session_id, prompt):
+            injected.append(prompt)
+            connection = sqlite3.connect(queue_db)
+            connection.execute(
+                "INSERT OR REPLACE INTO queued_items VALUES (?, ?, ?, ?, ?, ?)",
+                (item_id, SID, "{}", 1, 1, 1),
+            )
+            connection.commit()
+            connection.close()
+            state["stop_requested"] = True
+            loop_agent.save_state(SID, state)
+            return f"Queued message {item_id} for thread x."
+
+        with mock.patch.object(
+            loop_agent, "inject_via_queue", side_effect=fake_queue
+        ), mock.patch.object(loop_agent.time, "sleep"):
+            rc = loop_agent.run_loop(SID, session, state)
+        self.assertEqual(rc, 0)
+        self.assertEqual(injected, ["继续"])
+        self.assertEqual(loop_agent.queued_item_ids_for_thread(SID), set())
+        final = loop_agent.load_state(SID)
+        self.assertEqual(final.get("queued_item_ids") or [], [])
+        self.assertTrue(final.get("stop_requested"))
 
 
 def set_codex_home(value):

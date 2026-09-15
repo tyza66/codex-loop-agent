@@ -27,7 +27,6 @@ import subprocess
 import sys
 import time
 import sqlite3
-import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -693,6 +692,32 @@ def queued_item_ids_for_thread(session_id: str) -> set[str] | None:
     return {item_id for (item_id,) in rows}
 
 
+def cancel_queued_item(session_id: str, item_id: str) -> bool:
+    """Remove one of our still-pending queued items.
+
+    Called when the user stops the loop. Their intent is that the endless
+    continuation must not surface in the chat afterwards, so a continuation
+    still sitting in the queue has to be withdrawn. Returns True when the row
+    is gone afterwards (deleted now, or already consumed before).
+    """
+    path = queue_database_path()
+    if path is None:
+        return True
+    try:
+        connection = sqlite3.connect(str(path), timeout=5)
+        try:
+            connection.execute(
+                "DELETE FROM queued_items WHERE id = ? AND thread_id = ?",
+                (item_id, session_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError):
+        return False
+    return True
+
+
 def prune_queued_item_ids(
     session_id: str, queued_item_ids: set[str]
 ) -> set[str]:
@@ -700,6 +725,27 @@ def prune_queued_item_ids(
     if remaining is None:
         return set(queued_item_ids)
     return set(queued_item_ids) & remaining
+
+
+def reconcile_tracked_queue_items(session_id: str) -> set[str]:
+    """Drop tracked queue ids that are no longer pending, withdrawing the rest.
+
+    Used when a loop is not running: earlier driver versions could leave a
+    stale id behind, and that stale id must not linger in the state file or
+    keep a ghost continuation alive in the queue.
+    """
+    state = load_state(session_id)
+    tracked = set(state.get("queued_item_ids") or [])
+    if not tracked:
+        return tracked
+    present = queued_item_ids_for_thread(session_id)
+    if present is None:
+        return tracked
+    for item_id in sorted(tracked & present):
+        cancel_queued_item(session_id, item_id)
+    state["queued_item_ids"] = []
+    save_state(session_id, state)
+    return set()
 
 
 def queue_wait_outcome(
@@ -773,7 +819,41 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
         state["last_attempt_at"] = now_iso()
         persist_progress()
 
+    def withdraw_pending_queued_items() -> None:
+        """Pull back any continuation we queued but nobody consumed yet.
+
+        Stopping the loop must not leave a ghost user message behind, so
+        every tracked item is withdrawn and dropped from the tracked set.
+        """
+        if not queued_item_ids:
+            return
+        present = queued_item_ids_for_thread(session_id)
+        for item_id in sorted(queued_item_ids):
+            if present is not None and item_id not in present:
+                # Already consumed by the desktop; nothing left to withdraw.
+                log_line(
+                    session_id,
+                    "a queued continuation was already consumed",
+                    quiet,
+                )
+                continue
+            if cancel_queued_item(session_id, item_id):
+                log_line(
+                    session_id,
+                    "withdrew a queued continuation the desktop had not consumed yet",
+                    quiet,
+                )
+            else:
+                log_line(
+                    session_id,
+                    "could not withdraw a pending queued continuation",
+                    quiet,
+                )
+        queued_item_ids.clear()
+        persist_progress()
+
     def stop_loop(reason: str) -> int:
+        withdraw_pending_queued_items()
         state["stop_requested"] = True
         state["stop_reason"] = reason
         persist_progress("stopped")
@@ -892,6 +972,10 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
                         "a real user message arrived while the continuation was queued; yielding to it",
                         quiet,
                     )
+                    # The user is taking over this turn. Drop our still-pending
+                    # continuation so it cannot resurface later as a ghost
+                    # "user" message after the user's own turn has finished.
+                    withdraw_pending_queued_items()
                     persist_progress()
                     break
 
@@ -929,6 +1013,7 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
                 if current_state.get("stop_requested"):
                     return stop_loop("stop requested via state file")
                 if load_global_config().get("disabled"):
+                    withdraw_pending_queued_items()
                     persist_progress("disabled")
                     log_line(
                         session_id,
@@ -1076,6 +1161,9 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
 def _signal_handler(signum: int, frame: Any) -> None:
     if _CURRENT_SESSION:
         state = load_state(_CURRENT_SESSION)
+        for item_id in state.get("queued_item_ids") or []:
+            cancel_queued_item(_CURRENT_SESSION, item_id)
+        state["queued_item_ids"] = []
         state["stop_requested"] = True
         state["status"] = "stopped"
         save_state(_CURRENT_SESSION, state)
@@ -1132,6 +1220,11 @@ def cmd_start(args: argparse.Namespace) -> int:
         )
         return 1
 
+    # A previous run may have left a continuation pending in the desktop
+    # queue. Withdraw it before arming a new loop so the thread does not get
+    # an orphaned ghost message from the old run.
+    reconcile_tracked_queue_items(session_id)
+
     state = load_state(session_id)
     state.update(
         {
@@ -1140,6 +1233,9 @@ def cmd_start(args: argparse.Namespace) -> int:
             "status": "starting",
             "started_at": now_iso(),
             "armed_at": time.time(),
+            # Fresh activation: drop ids from any earlier run so stale
+            # tracking can never mask or duplicate this run's continuations.
+            "queued_item_ids": [],
             "stop_requested": False,
             "continuation": args.continuation
             or load_global_config().get("continuation", DEFAULT_CONTINUATION),
@@ -1248,6 +1344,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
         return 0
 
     for session_id, state in targets:
+        reconcile_tracked_queue_items(session_id)
         state["stop_requested"] = True
         state["status"] = "stopped"
         save_state(session_id, state)

@@ -12,6 +12,11 @@ completed assistant turn it resumes the same session with a configurable
 continuation prompt. It never runs ahead of a real user message, retries
 failures with exponential backoff, and keeps going until the user stops it.
 
+The driver delivers each continuation with `codex queue`, so it lands in the
+desktop thread as a normal user message without blocking the chat window. If
+the user already has messages waiting in the queue, the loop holds back and
+lets those run first.
+
 ## Activation
 
 1. Locate the bundled driver:
@@ -109,8 +114,9 @@ python3 "$SCRIPT" logs --dir "$PWD"
 ## Warnings
 
 An endless loop spends tokens until it is stopped. Use `--max-rounds`,
-`--until`, or the stop command to bound it. The driver uses only the flags
-accepted by the current `codex exec resume` implementation. The driver is
-designed for the same-session model: the app and the driver both append to the
-same session log, so avoid manually stopping or archiving during an active
-resume.
+`--until`, or the stop command to bound it.
+
+The driver delivers continuations through `codex queue` and waits for each
+one to be consumed before queueing the next. Stopping withdraws any
+continuation that is still pending in the queue, so a ghost continuation does
+not appear in the thread after the user stops.
