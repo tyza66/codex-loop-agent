@@ -1044,7 +1044,7 @@ class LoopAgentTests(unittest.TestCase):
             }
         )
         loop_agent.save_state(SID, state)
-        waiting_counts = iter([1, 1, 0, 0, 0])
+        waiting_counts = iter([0, 1, 1, 0, 0])
         injected = []
 
         def fake_queue(session_id, prompt):
@@ -1081,7 +1081,7 @@ class LoopAgentTests(unittest.TestCase):
         )
         loop_agent.save_state(SID, state)
         injected = []
-        counts = iter([1, 1, 1, 1, 0, 0])
+        counts = iter([0, 0, 0, 0, 0, 0])
 
         def fake_queue(session_id, prompt):
             injected.append(prompt)
@@ -1115,6 +1115,43 @@ class LoopAgentTests(unittest.TestCase):
         self.assertEqual(
             loop_agent.queue_wait_outcome(events, "继续", set(), baseline), "waiting"
         )
+
+    def test_queue_item_removal_marks_round_finished_without_reinjecting(self):
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "transport": "queue",
+                "cwd": str(self.home.resolve()),
+                "continuation": "继续",
+                "poll_ms": 1,
+                "quiet": True,
+            }
+        )
+        loop_agent.save_state(SID, state)
+        injected = []
+        present = iter([set(), set(), set()])
+
+        def fake_queue(session_id, prompt):
+            injected.append(prompt)
+            return "Queued message 66666666-6666-6666-6666-666666666666 for thread x."
+
+        def fake_ids(session_id):
+            return next(present, set())
+
+        def stop_after_round(seconds):
+            state["stop_requested"] = True
+            loop_agent.save_state(SID, state)
+
+        with mock.patch.object(
+            loop_agent, "inject_via_queue", side_effect=fake_queue
+        ), mock.patch.object(
+            loop_agent, "queued_item_ids_for_thread", side_effect=fake_ids
+        ), mock.patch.object(loop_agent.time, "sleep", side_effect=stop_after_round):
+            rc = loop_agent.run_loop(SID, session, state)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(injected), 1)
+        self.assertEqual(loop_agent.load_state(SID)["rounds"], 1)
 
     def test_old_stop_message_before_arm_time_does_not_stop(self):
         session = session_file(self.sessions_root, SID, str(self.home.resolve()))
@@ -1171,6 +1208,46 @@ class LoopAgentTests(unittest.TestCase):
         )
         for unsupported_flag in ("--cd", "--color", "--approve-for-me"):
             self.assertNotIn(unsupported_flag, command)
+
+
+    def test_user_queue_strictly_preempts_continuations(self):
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        state = loop_agent.load_state(SID)
+        state.update({
+            "transport": "queue",
+            "cwd": str(self.home.resolve()),
+            "continuation": "继续",
+            "poll_ms": 1,
+            "quiet": True,
+        })
+        loop_agent.save_state(SID, state)
+        injected = []
+
+        def fake_queue(session_id, prompt):
+            injected.append(prompt)
+            return "Queued message 77777777-7777-7777-7777-777777777777 for thread x."
+
+        def always_user_pending(session_id, **kwargs):
+            return 1
+
+        ticks = {"n": 0}
+
+        def stop_after_ticks(seconds):
+            ticks["n"] += 1
+            if ticks["n"] >= 6:
+                state["stop_requested"] = True
+                loop_agent.save_state(SID, state)
+
+        with mock.patch.object(
+            loop_agent, "inject_via_queue", side_effect=fake_queue
+        ), mock.patch.object(
+            loop_agent, "queued_user_message_count", side_effect=always_user_pending
+        ), mock.patch.object(
+            loop_agent.time, "sleep", side_effect=stop_after_ticks
+        ):
+            rc = loop_agent.run_loop(SID, session, state)
+        self.assertEqual(rc, 0)
+        self.assertEqual(injected, [])
 
 
 def set_codex_home(value):

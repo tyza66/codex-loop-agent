@@ -837,6 +837,16 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
 
         transport = str(state.get("transport") or "queue")
         if transport == "queue":
+            pending_user = queued_user_message_count(session_id)
+            if pending_user:
+                log_line(
+                    session_id,
+                    f"{pending_user} user message(s) are queued; holding the continuation",
+                    quiet,
+                )
+                persist_progress()
+                time.sleep(poll_seconds)
+                continue
             queued_at = max((m["ts"] for m in messages), default=0.0)
             log_line(session_id, f"round {rounds + 1}: queueing continuation", quiet)
             state["last_attempt_at"] = now_iso()
@@ -888,6 +898,16 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
                 waiting = queued_user_message_count(
                     session_id, own_prompt_sha=sha256_text(prompt)
                 )
+                present = queued_item_ids_for_thread(session_id)
+                if (
+                    queued_item_ids
+                    and present is not None
+                    and queued_item_ids.isdisjoint(present)
+                ):
+                    # The desktop consumed our queued continuation. Transcript
+                    # persistence can lag behind, so treat removal as consumed.
+                    observed = True
+                    break
                 now = time.time()
                 if not first_wait_logged or now - last_wait_log >= 60.0:
                     if waiting:
