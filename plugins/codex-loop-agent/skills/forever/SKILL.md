@@ -22,9 +22,12 @@ lets those run first.
 1. Locate the bundled driver:
 
 ```sh
-SCRIPT=$(find ~/.codex/plugins -path '*/codex-loop-agent/scripts/loop-agent.py' -print -quit)
+SCRIPT=$(find ~/.codex/plugins -name loop-agent.py -path '*codex-loop-agent*' 2>/dev/null | head -n 1)
 python3 "$SCRIPT" status --all
 ```
+
+The installed layout nests a version directory, so this search matches the
+path rather than an exact location.
 
 2. Make sure the global switch is ON:
 

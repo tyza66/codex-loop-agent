@@ -715,6 +715,62 @@ class LoopAgentTests(unittest.TestCase):
         self.assertEqual(captured["resolve"][1], None)
         self.assertEqual(captured["resolve"][2], True)
 
+    def test_background_child_forwards_unobserved_timeout(self):
+        """The watchdog must survive the background re-exec.
+
+        The duplicate-continuation storm happened by default in the
+        background child, so the timeout that bounds it has to be passed
+        through explicitly (or the child silently falls back to the default).
+        """
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        args = loop_agent.build_parser().parse_args(
+            [
+                "start",
+                "--session",
+                SID,
+                "--dir",
+                str(self.home.resolve()),
+                "--unobserved-timeout-seconds",
+                "12.5",
+            ]
+        )
+        idle = loop_agent.load_state(SID)
+        running = dict(
+            idle, pid=os.getpid(), pid_started="test-signature", status="running"
+        )
+        states = iter([idle])
+        captured = {}
+
+        class FakeProcess:
+            pid = os.getpid()
+
+            def poll(self):
+                return None
+
+        def capture(command, **kwargs):
+            captured["command"] = command
+            return FakeProcess()
+
+        def next_state(_sid):
+            return next(states, running)
+
+        with mock.patch.object(
+            loop_agent.subprocess, "Popen", side_effect=capture
+        ), mock.patch.object(
+            loop_agent, "resolve_session", return_value=(SID, session)
+        ), mock.patch.object(
+            loop_agent, "load_state", side_effect=next_state
+        ), mock.patch.object(
+            loop_agent, "save_state", return_value=loop_agent.state_path(SID)
+        ):
+            rc = loop_agent.cmd_start(args)
+        self.assertEqual(rc, 0)
+        command = captured["command"]
+        self.assertIn("--unobserved-timeout-seconds", command)
+        flag_index = command.index("--unobserved-timeout-seconds")
+        self.assertEqual(command[flag_index + 1], "12.5")
+        session = session_file(self.sessions_root, SID, "/tmp/session-cwd")
+
     def test_background_child_uses_session_cwd_marker(self):
         session = session_file(self.sessions_root, SID, "/tmp/session-cwd")
         args = loop_agent.build_parser().parse_args(
@@ -1131,11 +1187,15 @@ class LoopAgentTests(unittest.TestCase):
         )
         loop_agent.save_state(SID, state)
         injected = []
-        present = iter([set(), set(), set()])
+        # First look: our continuation is sitting in the queue. Second look:
+        # the desktop consumed it. That pending -> absent transition is the
+        # evidence that closes the round without re-injecting.
+        item_id = "66666666-6666-6666-6666-666666666666"
+        present = iter([{item_id}, set(), set(), set()])
 
         def fake_queue(session_id, prompt):
             injected.append(prompt)
-            return "Queued message 66666666-6666-6666-6666-666666666666 for thread x."
+            return f"Queued message {item_id} for thread x."
 
         def fake_ids(session_id):
             return next(present, set())
@@ -1153,6 +1213,59 @@ class LoopAgentTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(injected), 1)
         self.assertEqual(loop_agent.load_state(SID)["rounds"], 1)
+
+    def test_never_observed_continuation_never_counts_as_a_round(self):
+        """A continuation the queue never stored must not become a round.
+
+        Regression test: the driver used to treat "my tracked id is gone" as
+        proof of consumption even when the id was never pending, which let a
+        lagging transcript spin out dozens of identical rounds per minute.
+        """
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "transport": "queue",
+                "cwd": str(self.home.resolve()),
+                "continuation": "继续",
+                "poll_ms": 1,
+                "quiet": True,
+                "unobserved_timeout_seconds": 0.001,
+            }
+        )
+        loop_agent.save_state(SID, state)
+        injected = []
+        clock = iter([100.0 + i * 10.0 for i in range(500)])
+
+        def fake_queue(session_id, prompt):
+            injected.append(prompt)
+            return f"Queued message {len(injected):08d}-6666-6666-6666-666666666666 for thread x."
+
+        sleeps = []
+
+        def stop_after_several(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) >= 12:
+                state["stop_requested"] = True
+                loop_agent.save_state(SID, state)
+
+        with mock.patch.object(
+            loop_agent, "inject_via_queue", side_effect=fake_queue
+        ), mock.patch.object(
+            loop_agent, "queued_item_ids_for_thread", return_value=set()
+        ), mock.patch.object(
+            loop_agent.time, "time", side_effect=lambda: next(clock)
+        ), mock.patch.object(loop_agent.time, "sleep", side_effect=stop_after_several):
+            rc = loop_agent.run_loop(SID, session, state)
+        final = loop_agent.load_state(SID)
+        self.assertEqual(rc, 0)
+        self.assertEqual(final["rounds"], 0)
+        # Retrying is fine; inventing rounds and re-firing a fresh round for
+        # every poll is not. Every retry must be the same continuation, and
+        # the round counter must never advance on unproven consumption.
+        self.assertTrue(injected)
+        self.assertEqual(set(injected), {"继续"})
+        self.assertEqual(final["sent_hashes"], [])
 
     def test_old_stop_message_before_arm_time_does_not_stop(self):
         session = session_file(self.sessions_root, SID, str(self.home.resolve()))

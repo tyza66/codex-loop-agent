@@ -160,6 +160,7 @@ def load_state(session_id: str) -> dict[str, Any]:
         "backoff_factor": 2.0,
         "poll_ms": 2000,
         "timeout_seconds": 0,
+        "unobserved_timeout_seconds": 90.0,
         "transport": "queue",
         "quiet": False,
         "sent_hashes": [],
@@ -792,6 +793,12 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
     backoff_factor = float(state.get("backoff_factor") or 2.0)
     poll_seconds = float(state.get("poll_ms") or 2000) / 1000.0
     timeout = float(state.get("timeout_seconds") or 0)
+    # How long a continuation may sit accepted by the queue without ever
+    # surfacing as a pending row or reaching the transcript before we
+    # withdraw it and retry. A healthy desktop consumes or persists well
+    # within this window; waiting indefinitely here is what let a stalled
+    # queue masquerade as progress and refire the same prompt.
+    unobserved_timeout = float(state.get("unobserved_timeout_seconds") or 90.0)
     quiet = bool(state.get("quiet", False))
     # 0 means "no arm-time filter"; cmd_start stamps the real activation time.
     armed_at = float(state.get("armed_at") or 0.0)
@@ -964,8 +971,16 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
             # the queue never piles up duplicates and a busy thread cannot
             # trigger a re-injection storm.
             observed = False
+            # Consumption must be proven, never assumed. We remember the id
+            # this round handed to the queue and whether it was ever seen
+            # sitting there; a pending -> absent transition for that exact id
+            # is the only removal-based evidence that counts.
+            own_item_id = queued_item_id
+            own_item_seen_pending = False
+            unobserved = False
             first_wait_logged = False
             last_wait_log = 0.0
+            queued_since = time.time()
             while True:
                 if not session_file.exists():
                     return stop_loop("session file was archived or deleted")
@@ -993,15 +1008,22 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
                     session_id, own_prompt_sha=sha256_text(prompt)
                 )
                 present = queued_item_ids_for_thread(session_id)
-                if (
-                    queued_item_ids
-                    and present is not None
-                    and queued_item_ids.isdisjoint(present)
-                ):
-                    # The desktop consumed our queued continuation. Transcript
-                    # persistence can lag behind, so treat removal as consumed.
-                    observed = True
-                    break
+                if own_item_id and present is not None:
+                    if own_item_id in present:
+                        own_item_seen_pending = True
+                    elif own_item_seen_pending:
+                        # We watched our own id leave the queue: the desktop
+                        # really did consume this continuation. Transcript
+                        # persistence can lag, so this transition is enough.
+                        observed = True
+                        break
+                    else:
+                        # The id was never observed pending. That means either
+                        # the queue never stored it, or it was drained before
+                        # our first look. Neither proves the continuation ran,
+                        # so keep waiting for it to surface in the transcript
+                        # instead of firing another round.
+                        pass
                 now = time.time()
                 if not first_wait_logged or now - last_wait_log >= 60.0:
                     if waiting:
@@ -1019,6 +1041,25 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
                     first_wait_logged = True
                     last_wait_log = now
 
+                if not own_item_seen_pending and now - queued_since > unobserved_timeout:
+                    unobserved = True
+                    # The queue accepted the continuation but it never showed
+                    # up as a pending item and never reached the transcript.
+                    # Rather than spin out identical rounds, withdraw it and
+                    # retry with backoff so a stalled desktop cannot turn into
+                    # a re-injection storm.
+                    withdraw_pending_queued_items()
+                    detail = (
+                        "queued continuation was never observed in the queue "
+                        f"or transcript after {int(unobserved_timeout)}s"
+                    )
+                    log_line(session_id, detail, quiet)
+                    note_error("unobserved_continuation", detail)
+                    failed_prompt = prompt
+                    time.sleep(backoff)
+                    backoff = min(max_backoff, backoff * backoff_factor)
+                    break
+
                 current_state = load_state(session_id)
                 if current_state.get("stop_requested"):
                     return stop_loop("stop requested via state file")
@@ -1032,6 +1073,11 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
                     )
                     return 0
                 time.sleep(max(0.2, poll_seconds / 2.0))
+            if unobserved:
+                # Already backed off and set failed_prompt above; looping again
+                # re-queues the same continuation without burning a new round.
+                persist_progress()
+                continue
             if observed:
                 queued_item_ids = prune_queued_item_ids(session_id, queued_item_ids)
                 rounds += 1
@@ -1255,6 +1301,9 @@ def cmd_start(args: argparse.Namespace) -> int:
             "max_backoff_ms": float(args.max_backoff_ms),
             "backoff_factor": float(args.backoff_factor),
             "poll_ms": float(args.poll_ms),
+            "unobserved_timeout_seconds": float(
+                args.unobserved_timeout_seconds
+            ),
             "timeout_seconds": float(args.timeout_seconds or 0),
             "transport": args.transport,
             "quiet": bool(args.quiet),
@@ -1288,6 +1337,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         str(state["backoff_factor"]),
         "--poll-ms",
         str(state["poll_ms"]),
+        "--unobserved-timeout-seconds",
+        str(state.get("unobserved_timeout_seconds") or 90.0),
         "--timeout-seconds",
         str(state["timeout_seconds"]),
         "--transport",
@@ -1513,6 +1564,12 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--max-backoff-ms", type=float, default=32000)
     start.add_argument("--backoff-factor", type=float, default=2.0)
     start.add_argument("--poll-ms", type=float, default=2000, help="user-priority poll interval")
+    start.add_argument(
+        "--unobserved-timeout-seconds",
+        type=float,
+        default=90.0,
+        help="withdraw and retry a continuation the queue never acknowledges",
+    )
     start.add_argument("--timeout-seconds", type=float, default=0, help="max seconds per resume")
     start.add_argument("--transport", choices=("queue", "exec"), default="queue", help="how continuations are delivered")
     start.add_argument("--quiet", action="store_true")
