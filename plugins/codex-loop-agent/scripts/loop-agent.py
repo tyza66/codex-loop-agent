@@ -807,8 +807,13 @@ def queue_wait_outcome(
     """
     messages = event_user_messages(events)
     own_sha = sha256_text(prompt)
+    # Strictly after the baseline. The baseline is the newest transcript
+    # timestamp at injection time, which for consecutive rounds IS the
+    # previous round's own continuation. Matching ts == baseline would
+    # therefore treat the older copy as this round's, closing the round
+    # instantly and firing another identical continuation.
     for message in messages:
-        if message["sha"] == own_sha and message["ts"] >= baseline_ts:
+        if message["sha"] == own_sha and message["ts"] > baseline_ts:
             return "observed"
     for message in messages:
         if message["sha"] in sent_hashes:
@@ -1604,7 +1609,7 @@ def cmd_logs(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="codex-loop-agent", description=__doc__)
-    parser.add_argument("--version", action="version", version="codex-loop-agent 1.0.20260917")
+    parser.add_argument("--version", action="version", version="codex-loop-agent 1.0.20260918")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     start = subparsers.add_parser("start", help="start an endless loop for a Codex session")

@@ -1160,6 +1160,31 @@ class LoopAgentTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(injected), 1)
 
+    def test_queue_wait_does_not_match_continuation_at_the_baseline(self):
+        """A continuation sitting exactly at the baseline is the previous round's.
+
+        Regression test for the duplicate-continuation storm: queued_at is
+        derived from the newest transcript message, which after round 1 IS
+        round 1's own continuation. Treating ts == baseline as "observed"
+        closed every following round instantly and re-fired the prompt.
+        """
+        ts = loop_agent.iso_to_epoch("2026-09-13T00:00:07.000Z")
+        events = [
+            {
+                "type": "event_msg",
+                "timestamp": "2026-09-13T00:00:07.000Z",
+                "payload": {"type": "user_message", "message": "继续"},
+            }
+        ]
+        self.assertEqual(
+            loop_agent.queue_wait_outcome(events, "继续", set(), ts), "waiting"
+        )
+        # A copy that genuinely arrived later still counts as observed.
+        self.assertEqual(
+            loop_agent.queue_wait_outcome(events, "继续", set(), ts - 1.0),
+            "observed",
+        )
+
     def test_queue_wait_ignores_matching_prompt_from_before_baseline(self):
         baseline = loop_agent.iso_to_epoch("2026-09-13T00:00:10.000Z")
         events = [
