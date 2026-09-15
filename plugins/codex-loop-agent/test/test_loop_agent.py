@@ -1600,6 +1600,51 @@ class LoopAgentTests(unittest.TestCase):
         ):
             self.assertEqual(loop_agent.prune_queued_item_ids(SID, tracked), tracked)
 
+    def test_orphaned_continuation_items_finds_only_untracked_matches(self):
+        items = [
+            ("tracked", "继续"),
+            ("orphan", "继续"),
+            ("human", "帮我改个 bug"),
+        ]
+        with mock.patch.object(
+            loop_agent, "queued_items_for_thread", return_value=items
+        ):
+            found = loop_agent.orphaned_continuation_items(
+                SID, "继续", {"tracked"}
+            )
+        self.assertEqual(found, [("orphan", "继续")])
+
+    def test_session_archived_or_deleted_detects_archive_move(self):
+        active = self.sessions_root / f"rollout-x-{SID}.jsonl"
+        active.write_text("", encoding="utf-8")
+        self.assertFalse(loop_agent.session_archived_or_deleted(SID, active))
+
+        # Archiving moves the rollout into archived_sessions/; the loop must
+        # still stop even though nothing was deleted outright.
+        archived_root = self.home / "archived_sessions"
+        archived_root.mkdir(parents=True, exist_ok=True)
+        moved = archived_root / active.name
+        active.rename(moved)
+        self.assertTrue(loop_agent.session_archived_or_deleted(SID, active))
+
+    def test_session_archived_or_deleted_detects_deletion(self):
+        missing = self.sessions_root / f"rollout-gone-{SID}.jsonl"
+        self.assertTrue(loop_agent.session_archived_or_deleted(SID, missing))
+        tracked = {"still-there", "consumed"}
+        with mock.patch.object(
+            loop_agent,
+            "queued_item_ids_for_thread",
+            return_value={"still-there"},
+        ):
+            self.assertEqual(
+                loop_agent.prune_queued_item_ids(SID, tracked), {"still-there"}
+            )
+        # An unreadable queue keeps the tracked set so nothing is forgotten.
+        with mock.patch.object(
+            loop_agent, "queued_item_ids_for_thread", return_value=None
+        ):
+            self.assertEqual(loop_agent.prune_queued_item_ids(SID, tracked), tracked)
+
     def test_queue_wait_outcome_treats_own_prompt_as_observed(self):
         baseline = loop_agent.iso_to_epoch("2026-09-13T00:00:10.000Z")
         events = [

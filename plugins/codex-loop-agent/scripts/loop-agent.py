@@ -337,6 +337,22 @@ def session_id_from_path(path: Path) -> str | None:
     return match.group(0) if match else None
 
 
+def session_archived_or_deleted(_session_id: str, session_file: Path) -> bool:
+    """True once the thread is no longer live in the active sessions tree.
+
+    The desktop archives a thread by moving its rollout file out of
+    ``sessions/`` and into ``archived_sessions/``, so the original path
+    going missing is not enough to distinguish archive from deletion --
+    both mean the thread is gone and the loop must stop either way.
+    """
+    if session_file.exists():
+        return False
+    # The rollout is either still live at its active path, or the thread is
+    # gone. Archiving relocates the file to archived_sessions/ and deleting
+    # removes it outright; in both cases the loop must stop.
+    return True
+
+
 def session_cwd(path: Path) -> str | None:
     try:
         with path.open(encoding="utf-8", errors="ignore") as handle:
@@ -619,6 +635,30 @@ def queue_database_path() -> Path | None:
     return matches[-1] if matches else None
 
 
+def orphaned_continuation_items(
+    session_id: str,
+    continuation: str,
+    known_ids: set[str],
+) -> list[tuple[str, str]]:
+    """Find our own continuations sitting in the queue but not tracked.
+
+    A previous driver run (or a crash) can leave a continuation pending
+    without a matching state entry. Those orphans would otherwise block
+    the loop forever: they are not user messages, yet the queue is never
+    empty, so nothing may be injected. Surfacing them lets the driver adopt
+    and withdraw them, keeping at most one continuation in the queue.
+    """
+    items = queued_items_for_thread(session_id)
+    if not items:
+        return []
+    target = sha256_text(continuation)
+    return [
+        (item_id, text)
+        for item_id, text in items
+        if item_id not in known_ids and sha256_text(text) == target
+    ]
+
+
 def queued_user_message_count(
     session_id: str,
     own_prompt_sha: str | None = None,
@@ -895,8 +935,8 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
             return stop_loop("--until deadline reached")
 
         events = read_events(session_file)
-        if not session_file.exists():
-            return stop_loop("session file was archived or deleted")
+        if session_archived_or_deleted(session_id, session_file):
+            return stop_loop("session was archived or deleted")
         last_completion = max(last_completion, last_completion_ts(events))
         messages = event_user_messages(events)
 
@@ -929,6 +969,25 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
 
         transport = str(state.get("transport") or "queue")
         if transport == "queue":
+            # Hard invariant: never let our own continuations pile up. If a
+            # previous run left one pending, adopt it instead of queueing a
+            # second copy. Stopping the desktop side of the loop will not
+            # drain the queue, so an orphan would otherwise sit there and
+            # block the loop forever.
+            orphans = orphaned_continuation_items(
+                session_id, continuation, queued_item_ids
+            )
+            if orphans:
+                for orphan_id, _text in orphans:
+                    queued_item_ids.add(orphan_id)
+                log_line(
+                    session_id,
+                    f"adopted {len(orphans)} orphaned continuation(s) left by an earlier run",
+                    quiet,
+                )
+                persist_progress()
+                time.sleep(poll_seconds)
+                continue
             # Our own continuation may still be sitting in the queue while
             # the desktop has not picked it up yet. It is not a human
             # message, so exclude every id we already track.
@@ -982,8 +1041,8 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
             last_wait_log = 0.0
             queued_since = time.time()
             while True:
-                if not session_file.exists():
-                    return stop_loop("session file was archived or deleted")
+                if session_archived_or_deleted(session_id, session_file):
+                    return stop_loop("session was archived or deleted")
 
                 outcome = queue_wait_outcome(
                     read_events(session_file), prompt, sent_hashes, queued_at
@@ -1545,7 +1604,7 @@ def cmd_logs(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="codex-loop-agent", description=__doc__)
-    parser.add_argument("--version", action="version", version="codex-loop-agent 1.0.20260916")
+    parser.add_argument("--version", action="version", version="codex-loop-agent 1.0.20260917")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     start = subparsers.add_parser("start", help="start an endless loop for a Codex session")
