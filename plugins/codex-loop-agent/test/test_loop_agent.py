@@ -1275,6 +1275,81 @@ class LoopAgentTests(unittest.TestCase):
         )
         self.assertEqual(other, {"item-other"})
 
+    def test_cancel_queued_item_reports_only_real_deletions(self):
+        queue_db = self.home / "queue_1.sqlite"
+        connection = sqlite3.connect(queue_db)
+        connection.execute(
+            "CREATE TABLE queued_items (id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL, payload_json TEXT NOT NULL, queue_order INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO queued_items VALUES (?, ?, ?, ?, ?, ?)",
+            ("item-1", SID, "{}", 1, 1, 1),
+        )
+        connection.commit()
+        connection.close()
+
+        # A mismatched thread or a stale id deletes nothing, so it must not
+        # report a withdrawal that never happened.
+        self.assertFalse(loop_agent.cancel_queued_item(OTHER_SID, "item-1"))
+        self.assertFalse(loop_agent.cancel_queued_item(SID, "missing"))
+        self.assertTrue(loop_agent.cancel_queued_item(SID, "item-1"))
+        # The row is gone now, so a second attempt is no longer a success.
+        self.assertFalse(loop_agent.cancel_queued_item(SID, "item-1"))
+
+    def test_queued_user_message_count_excludes_tracked_own_item(self):
+        own_id = "77777777-7777-7777-7777-777777777777"
+        items = [(own_id, "继续"), ("other-id", "真实用户")]
+        with mock.patch.object(
+            loop_agent, "queued_items_for_thread", return_value=items
+        ):
+            # Our own continuation must not count as a pending human message.
+            self.assertEqual(loop_agent.queued_user_message_count(SID), 2)
+            self.assertEqual(
+                loop_agent.queued_user_message_count(SID, own_item_ids={own_id}),
+                1,
+            )
+
+    def test_run_loop_does_not_stall_on_its_own_queued_continuation(self):
+        session = session_file(self.sessions_root, SID, str(self.home.resolve()))
+        own_id = "77777777-7777-7777-7777-777777777777"
+        state = loop_agent.load_state(SID)
+        state.update(
+            {
+                "transport": "queue",
+                "cwd": str(self.home.resolve()),
+                "continuation": "继续",
+                "poll_ms": 1,
+                "quiet": True,
+                "queued_item_ids": [own_id],
+            }
+        )
+        loop_agent.save_state(SID, state)
+        injected = []
+        # The queue still holds the driver's own continuation and the
+        # transcript never shows it consumed. The loop must keep working
+        # instead of treating that item as a pending human message forever.
+
+        def fake_queue(session_id, prompt):
+            injected.append(prompt)
+            return f"Queued message {own_id} for thread x."
+
+        def stop_after(seconds):
+            state["stop_requested"] = True
+            loop_agent.save_state(SID, state)
+
+        with mock.patch.object(
+            loop_agent, "inject_via_queue", side_effect=fake_queue
+        ), mock.patch.object(
+            loop_agent, "queued_items_for_thread", return_value=[(own_id, "继续")]
+        ), mock.patch.object(
+            loop_agent,
+            "queued_item_ids_for_thread",
+            return_value={own_id},
+        ), mock.patch.object(loop_agent.time, "sleep", side_effect=stop_after):
+            rc = loop_agent.run_loop(SID, session, state)
+        self.assertEqual(rc, 0)
+        self.assertEqual(injected, ["继续"])
+
     def test_reconcile_withdraws_stale_tracked_items(self):
         queue_db = self.home / "queue_1.sqlite"
         connection = sqlite3.connect(queue_db)

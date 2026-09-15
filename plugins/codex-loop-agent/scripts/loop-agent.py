@@ -621,13 +621,17 @@ def queue_database_path() -> Path | None:
 def queued_user_message_count(
     session_id: str,
     own_prompt_sha: str | None = None,
+    own_item_ids: set[str] | None = None,
 ) -> int | None:
     """Count queued items that are not this prompt's own continuation."""
     items = queued_items_for_thread(session_id)
     if items is None:
         return None
+    tracked = own_item_ids or set()
     count = 0
     for _item_id, text in items:
+        if _item_id in tracked:
+            continue
         if own_prompt_sha and sha256_text(text) == own_prompt_sha:
             continue
         count += 1
@@ -702,20 +706,21 @@ def cancel_queued_item(session_id: str, item_id: str) -> bool:
     """
     path = queue_database_path()
     if path is None:
-        return True
+        return False
     try:
         connection = sqlite3.connect(str(path), timeout=5)
         try:
-            connection.execute(
+            cursor = connection.execute(
                 "DELETE FROM queued_items WHERE id = ? AND thread_id = ?",
                 (item_id, session_id),
             )
+            deleted = cursor.rowcount
             connection.commit()
         finally:
             connection.close()
     except (sqlite3.Error, OSError):
         return False
-    return True
+    return deleted > 0
 
 
 def prune_queued_item_ids(
@@ -917,7 +922,12 @@ def run_loop(session_id: str, session_file: Path, state: dict[str, Any]) -> int:
 
         transport = str(state.get("transport") or "queue")
         if transport == "queue":
-            pending_user = queued_user_message_count(session_id)
+            # Our own continuation may still be sitting in the queue while
+            # the desktop has not picked it up yet. It is not a human
+            # message, so exclude every id we already track.
+            pending_user = queued_user_message_count(
+                session_id, own_item_ids=queued_item_ids
+            )
             if pending_user:
                 log_line(
                     session_id,
